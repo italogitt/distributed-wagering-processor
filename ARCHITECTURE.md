@@ -79,6 +79,11 @@ Não dividi o código por módulo de negócio (wallet, transaction etc.). Quase 
 - **Por quê:** prefiro que um `down` falhe a apagar FKs em silêncio.
 - **Trade-off:** um `down` pode falhar e exigir ajuste manual.
 
+### D13. Ledger imutável no próprio schema
+- **Decisão:** triggers (funções que o banco roda sozinho quando um comando acontece) recusam `UPDATE`, `DELETE` e `TRUNCATE` na tabela do ledger. Os de `UPDATE` e `DELETE` ficam declarados no `@Trigger` do MikroORM. O de `TRUNCATE` escrevi à mão na migration, por uma limitação do MikroORM.
+- **Por quê:** `TODO: por que garantir a imutabilidade no banco, e não só na aplicação?`
+- **Trade-off:** o trigger de `TRUNCATE` fica fora do `@Trigger`, então o ORM não sabe dele e eu mantenho esse trecho à mão. Ele também não barra `DROP TABLE` (ver Limitações).
+
 ## Concorrência
 
 ### D10. UPDATE condicional no banco; `wallet.version` é só um contador
@@ -90,7 +95,10 @@ Não dividi o código por módulo de negócio (wallet, transaction etc.). Quase 
 
 ## Idempotência
 
-_A preencher._
+### D12. `balance_after` em `transactions` para o replay
+- **Decisão:** cada transação guarda `balance_after`, o saldo observado quando ela foi processada. No replay (reenvio de uma requisição já processada), devolvo esse valor.
+- **Por quê:** o replay deve devolver o saldo da época, não o atual. `LOSS` e `REJECTED` não geram linha no ledger, então não dá para tirar esse saldo de lá.
+- **Trade-off:** `TODO: custo dessa escolha.`
 
 ## Mensageria (inbox/outbox/SQS)
 
@@ -110,16 +118,23 @@ _A preencher._
 
 ## Testes
 
-_A preencher._
+### D14. Reset do banco recriando o schema
+- **Decisão:** entre os testes, reseto o banco recriando o schema, não com `TRUNCATE`.
+- **Por quê:** `TODO: motivo (é porque o trigger da D13 recusa TRUNCATE no ledger?)`
+- **Trade-off:** `TODO: custo dessa escolha.`
 
 ## 4. Interpretações do enunciado
 
 | # | Trecho / dúvida | Minha interpretação | Status |
 |---|---|---|---|
 | I1 | `transactions` no enunciado tem `referenceTransactionId` (id interno) e `processedAt`, que a minha modelagem não tem. | `TODO` | Em aberto |
-| I2 | O replay (reenvio de uma requisição já processada) deve devolver o saldo da época. Mas `LOSS` e `REJECTED` não geram ledger, então não dá para tirar esse saldo do ledger. | Provavelmente preciso de `balance_after` em `transactions`. | Em aberto |
+| I2 | O replay deve devolver o saldo da época. Mas `LOSS` e `REJECTED` não geram ledger, então não dá para tirar esse saldo do ledger. | Guardo `balance_after` em `transactions` (D12). | Decidido |
 | I3 | `inbox_messages` no enunciado tem `payloadHash` e `processedAt`. | `TODO` | Em aberto |
 | I4 | `outbox_events` no enunciado tem `nextAttemptAt`. | `TODO` | Em aberto |
+| I5 | O `WIN` pode trazer uma referência a outra transação? | Pode. Quando vem, valido a referência do mesmo jeito que nas reversões (`REFUND` e `ROLLBACK`, operações que desfazem outra transação). | Decidido |
+| I6 | Quantas vezes uma transação pode ser revertida? | Uma vez no total, somando `REFUND` e `ROLLBACK`. É mais restrito que o enunciado. Sem isso, um `REFUND` mais um `ROLLBACK` da mesma aposta creditariam o valor duas vezes. | Decidido |
+| I7 | Valor do `LOSS`. | Sempre `0`. | Decidido |
+| I8 | Requisição para wallet inexistente, ou com player ou moeda diferentes dos da wallet. | Devolvo 4xx e não gravo nada. `TODO: qual status exato?` | Decidido |
 
 ## 5. Limitações conhecidas
 
@@ -127,6 +142,10 @@ _A preencher._
 - Quem grava no banco sem passar pelo `Money` sofre o arredondamento silencioso do Postgres (D4).
 - O banco não garante que o `player_id` existe (D6).
 - Os `down` das migrations podem falhar e pedir ajuste manual (D9).
+- Requisições recusadas por wallet inexistente, player ou moeda diferentes não ficam gravadas. Então não existe registro de idempotência para elas, e um reenvio é validado de novo do zero (I8).
+- `failure_code` é texto livre no banco. A lista de códigos válidos fica só no domínio, então o banco aceitaria qualquer texto.
+- Os triggers do ledger não barram `DROP TABLE`. Quem tem permissão de DDL (comandos que mudam a estrutura do banco, como `CREATE`, `ALTER` e `DROP`) ainda consegue apagar o ledger. Num ambiente real, a aplicação usaria um usuário do banco sem permissão de DDL (D13).
+- O banco não garante que a wallet e a moeda de um lançamento do ledger são as mesmas da transação. O `UNIQUE (wallet_id, transaction_id)` não impede que um bug crie um lançamento numa wallet diferente da transação. Uma FK composta (FK sobre mais de uma coluna ao mesmo tempo) resolveria, mas não usei. `TODO: qual decisão justifica não usar FK composta?`
 
 ## 6. Pendências
 
@@ -136,8 +155,13 @@ _A preencher._
 - `TODO:` D7, por que a lista de moedas fica no domínio e não no banco.
 - `TODO:` D8, trade-off das constraints com nome explícito.
 - `TODO:` D11, trade-off de usar o MikroORM.
+- `TODO:` D12, trade-off do `balance_after`.
+- `TODO:` D13, por que garantir a imutabilidade do ledger no banco.
+- `TODO:` D14, motivo e trade-off de resetar o banco recriando o schema.
+- `TODO:` limitação do ledger, qual decisão justifica não usar FK composta.
+- `TODO:` I8, status HTTP exato para wallet inexistente e para player/moeda diferentes.
+- `TODO:` taxonomia de `failureCode`.
 - `TODO:` confirmar se a tabela `wallets` tem `CHECK (balance >= 0)` como segunda proteção contra saldo negativo.
 - Em aberto: I1, `referenceTransactionId` e `processedAt` em `transactions`.
-- Em aberto: I2, `balance_after` em `transactions` para o replay.
 - Em aberto: I3, `payloadHash` e `processedAt` em `inbox_messages`.
 - Em aberto: I4, `nextAttemptAt` em `outbox_events`.
