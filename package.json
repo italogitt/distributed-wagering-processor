@@ -5,6 +5,8 @@
   "scripts": {
     "start": "bun src/main.ts",
     "typecheck": "tsc --noEmit",
+    "test": "bun test",
+    "test:watch": "bun test --watch",
     "orm": "bunx --bun mikro-orm",
     "migration:create": "bunx --bun mikro-orm migration:create",
     "migration:up": "bunx --bun mikro-orm migration:up",

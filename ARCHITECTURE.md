@@ -47,10 +47,24 @@ Não dividi o código por módulo de negócio (wallet, transaction etc.). Quase 
 
 ## Dinheiro
 
-### D4. `numeric(20,2)` no banco, string no TypeScript e na API
-- **Decisão:** valores ficam em `numeric(20,2)` no Postgres e trafegam como string no código e na API. O value object `Money` rejeita valores com mais de 2 casas decimais.
-- **Por quê:** o MikroORM v7 já devolve `decimal` como string. E o Postgres arredonda em silêncio: `1.005` vira `1.01`. Por isso a validação tem que estar no `Money`, antes de chegar no banco.
-- **Trade-off:** o banco sozinho não protege contra casas a mais. Quem grava sem passar pelo `Money` fica sujeito ao arredondamento silencioso.
+### D4. `Money` em centavos (`bigint`) por dentro, string com 2 casas nas bordas, `numeric(20,2)` no banco
+- **Decisão:** o value object `Money` guarda o valor como `bigint` em centavos (`"25.00"` → `2500n`). A string decimal com 2 casas só existe nas bordas: na entrada (`from`), na saída (`toJSON`/`toString`) e no banco, onde a coluna é `numeric(20,2)`.
+- **Por quê:** o enunciado fixa a escala em 2 casas para toda moeda, então todo valor é um número inteiro de centavos. O `bigint` é nativo do JavaScript, exato, e não traz dependência para o domínio. O MikroORM v7 devolve `decimal` como string, que é o mesmo formato das bordas.
+- **Trade-off:** preciso converter string ↔ centavos na mão no `from` e no `toJSON`. E `JSON.stringify` quebra com `bigint`, então o valor nunca pode sair do `Money` sem passar pelo `toJSON`.
+- **Alternativa descartada:** `Decimal`, que o esqueleto sugere. A seção 6 do enunciado permite adaptar, desde que as garantias se mantenham (ver I11).
+- **Exemplo:** `0.1 + 0.2` em `number` dá `0.30000000000000004`. Em centavos, `10n + 20n = 30n` → `"0.30"`.
+
+### D20. `Money`: sinal, zero e moedas diferentes
+- **Decisão:** `Money.from()` rejeita valor negativo, mas `subtract` e `negate` podem gerar negativo. Zero é válido (`Money.zero`). Entre moedas diferentes, `add`, `subtract` e `isLessThan` lançam erro de domínio, enquanto `equals` devolve `false`. A regra "> 0, ou = 0 para `LOSS`" fica na `WagerTransaction`, não no `Money`.
+- **Por quê:** o enunciado proíbe negativos "em contratos de entrada", mas o próprio esqueleto tem `negate()` e `isNegative()` (ver I9). O `from()` é a porta das strings externas (API, fila, banco), e nenhuma delas é negativa: o saldo é sempre ≥ 0, e o lançamento do ledger guarda valor positivo com uma direção. Já o negativo no meio de uma conta é útil, porque é com ele que a `Wallet` detecta saldo insuficiente. O `equals` é uma pergunta, e "10 BRL ≠ 10 USD" é uma resposta válida, não um erro.
+- **Trade-off:** fica uma assimetria. `negate()` gera `"-10.00"` no `toJSON`, e o `from()` não aceita essa string de volta. Na prática isso nunca acontece, porque nenhum negativo é persistido nem recebido.
+- **Exemplo:** saldo 20, `BET` de 30 → `subtract` dá −10 → a `Wallet` vê `isNegative()` e decide "saldo insuficiente". O `Money` só fez a conta.
+
+### D21. `Money`: formato de entrada estrito
+- **Decisão:** o `from()` aceita só `^\d+\.\d{2}$`, sem zeros à esquerda (`"025.00"` é rejeitado; `"0.50"` é aceito). `"25"`, `"25.5"`, `"1.005"`, `"1e3"`, `"NaN"`, `"Infinity"`, `""` e negativos são rejeitados.
+- **Por quê:** o enunciado mostra `"25.00"` e exige "escala fixa de 2 casas" (ver I10). Com uma única grafia por valor, o `payloadHash` (hash do corpo da requisição, usado para detectar reenvio com conteúdo diferente) fica estável. Além disso, o Postgres arredonda `numeric` em silêncio (`1.005` vira `1.01`), então só o domínio consegue barrar casas a mais.
+- **Trade-off:** um provedor que mande `"25"` recebe 4xx em vez de ter o valor normalizado.
+- **Exemplo:** se a entrada fosse tolerante, `"25.5"` e `"25.50"` poderiam gerar hashes diferentes, e o reenvio da mesma aposta viraria conflito de idempotência.
 
 ## Banco de dados e schema
 
@@ -92,6 +106,32 @@ Não dividi o código por módulo de negócio (wallet, transaction etc.). Quase 
 - **Trade-off:** o `version` não detecta concorrência, só conta as mudanças de saldo.
 - **Alternativa descartada:** optimistic lock (trava otimista: ler o saldo e a versão, calcular na aplicação e gravar com `WHERE version = <versão lida>`), sozinho ou junto com o UPDATE condicional. Ele precisa de mais idas ao banco (SELECT + UPDATE) e de retry quando há conflito. E ele recusa sempre que algo mudou desde a leitura, mesmo com saldo sobrando, o que gera conflitos falsos.
 - **Exemplo:** saldo 100, duas apostas de 80 ao mesmo tempo → a primeira deixa o saldo em 20, a segunda não encontra `balance >= 80` → só uma passa. Já com duas apostas de 10: no UPDATE condicional as duas passam (saldo 80). Com optimistic lock, a segunda falharia por conflito de versão, mesmo havendo saldo.
+
+### D22. O banco decide a corrida; a `Wallet` é reidratada com o estado de antes
+- **Decisão:** o UPDATE condicional da D10 roda primeiro, com `WHERE id = :id AND balance >= :valor RETURNING balance, version`. Se ele afeta uma linha, reidrato a `Wallet` com o estado de antes do UPDATE: saldo devolvido + valor, `version` devolvida − 1. Em seguida, `wallet.debit(...)` aplica a operação em memória, valida o resultado e gera o lançamento. Se o UPDATE afeta 0 linhas, o saldo é insuficiente e a transação vira `REJECTED`.
+- **Por quê:** a `Wallet` carregada no início da requisição pode estar desatualizada. No cenário obrigatório, duas instâncias carregam saldo 100 e as duas acham que podem debitar 80. Só o banco vê o saldo real na hora da escrita. Depois do UPDATE, a linha fica travada pela transação SQL até o commit, então o "antes" calculado é exato e o lançamento do ledger sempre bate com o banco.
+- **Trade-off:** o fluxo é menos intuitivo, porque o UPDATE vem antes do método de domínio. E a checagem de saldo do domínio vira uma segunda trava, que na prática só dispara se houver bug.
+- **Exemplo:** saldo 100, duas `BET`s de 80 ao mesmo tempo. O UPDATE da primeira devolve 20 → reidrato com saldo 100 / version 1 → `debit(80)` → lançamento 100 → 20, version 2. O UPDATE da segunda testa `WHERE 20 >= 80` → 0 linhas → `REJECTED`, sem lançamento.
+
+## Wallet: regras do agregado
+
+Agregado: um grupo de objetos que muda junto e tem uma entidade principal. Aqui, a `Wallet` e os seus lançamentos do ledger.
+
+### D23. `debit` e `credit` devolvem o lançamento
+- **Decisão:** `debit` e `credit` devolvem um `WalletLedgerEntry`. O `debit` lança erro de domínio se o saldo ficaria negativo, e os dois lançam erro se a moeda não for a da wallet. A `version` sobe +1 a cada chamada.
+- **Por quê:** a regra "toda alteração de saldo tem lançamento" passa a ser estrutural: não há como mudar o saldo sem criar o lançamento. O erro do `debit` não é caminho de negócio. Como o banco já barrou o saldo insuficiente (D22), chegar nele indica bug.
+- **Trade-off:** a `Wallet` passa a conhecer o `WalletLedgerEntry`. Acho aceitável, porque ele faz parte do agregado. E isso garante que o lançamento seja criado, mas não que seja salvo. A D24 resolve essa parte.
+
+### D24. Um método só no repositório para debitar e creditar
+- **Decisão:** a porta do repositório expõe `applyDebit(walletId, money, transactionId)` e `applyCredit(...)`. Cada um executa junto, na mesma transação SQL: o UPDATE condicional, a reidratação, `wallet.debit`/`credit` e a gravação do lançamento. O resultado é o lançamento ou "saldo insuficiente". Não existe método separado para só atualizar o saldo.
+- **Por quê:** com os passos soltos no caso de uso, alguém poderia rodar o UPDATE e esquecer o lançamento, e o TypeScript não avisa quando um retorno é ignorado. Com um método só, a regra "toda alteração de saldo tem lançamento" vale em todo caminho que passa pelo repositório.
+- **Trade-off:** o repositório fica mais "esperto" que um simples buscar/salvar, porque passa a conter parte da orquestração.
+
+### D25. Abertura da wallet com saldo inicial
+- **Decisão:** `Wallet.open({ id, playerId, initialBalance, openingTransactionId, at })` cria a wallet já com o saldo inicial e `version = 1`. Se `initialBalance > 0`, devolve também o lançamento `CREDIT` (antes 0, depois o saldo inicial), ligado à transação `OPENING`. Com saldo zero, não há transação nem lançamento.
+- **Por quê:** o enunciado diz que a `version` começa em 1 depois da criação (ver I12). Abrir com 0 e chamar `credit` daria `version = 2`.
+- **Trade-off:** o `open` não reaproveita o `credit` e tem uma regra própria para a `version`.
+- **Exemplo:** `open` com 50.00 BRL → wallet com saldo 50.00, version 1, e um lançamento `CREDIT` 0.00 → 50.00.
 
 ## Idempotência
 
@@ -160,11 +200,17 @@ _A preencher._
 | I6 | Quantas vezes uma transação pode ser revertida? | Uma vez no total, somando `REFUND` e `ROLLBACK`. É mais restrito que o enunciado. Sem isso, um `REFUND` mais um `ROLLBACK` da mesma aposta creditariam o valor duas vezes. | Decidido |
 | I7 | Valor do `LOSS`. | Sempre `0`. | Decidido |
 | I8 | Requisição para wallet inexistente, ou com player ou moeda diferentes dos da wallet. | Devolvo 4xx e não gravo nada. `TODO: qual status exato?` | Decidido |
+| I9 | O enunciado proíbe negativos "em contratos de entrada", mas o esqueleto do `Money` tem `negate()` e `isNegative()`. | Negativo é proibido só na entrada (`from()`). Dentro das contas ele pode existir (D20). | Decidido |
+| I10 | "Escala fixa de 2 casas", com exemplos como `"25.00"`. | Aceito só a grafia exata com 2 casas. `"25"` e `"25.5"` são rejeitados, não normalizados (D21). | Decidido |
+| I11 | O esqueleto sugere `Decimal` para o `Money`. | Uso `bigint` em centavos. A seção 6 permite adaptar, desde que as garantias se mantenham (D4). | Decidido |
+| I12 | A `version` começa em 1 depois da criação. E se a wallet abrir com saldo inicial? | O crédito de abertura não conta como mudança de versão: a wallet nasce com o saldo e `version = 1` (D25). | Decidido |
 
 ## 5. Limitações conhecidas
 
 - O CHECK de moeda aceita qualquer código de 3 letras maiúsculas (ex.: `XYZ`). Só o domínio barra moedas que não existem (D7).
-- Quem grava no banco sem passar pelo `Money` sofre o arredondamento silencioso do Postgres (D4).
+- Quem grava no banco sem passar pelo `Money` sofre o arredondamento silencioso do Postgres (D21).
+- `negate()` gera `"-10.00"` no `toJSON`, mas o `from()` não aceita essa string de volta. Hoje nenhum negativo é persistido nem recebido, então isso não acontece na prática (D20).
+- Um provedor que mande `"25"` ou `"25.5"` recebe 4xx. Não normalizo o valor (D21).
 - O banco não garante que o `player_id` existe (D6).
 - Os `down` das migrations podem falhar e pedir ajuste manual (D9).
 - Requisições recusadas por wallet inexistente, player ou moeda diferentes não ficam gravadas. Então não existe registro de idempotência para elas, e um reenvio é validado de novo do zero (I8).
@@ -190,5 +236,6 @@ _A preencher._
 - `TODO:` D18, por que a ordem por aggregate importa.
 - `TODO:` I8, status HTTP exato para wallet inexistente e para player/moeda diferentes.
 - `TODO:` taxonomia de `failureCode`.
+- `TODO:` D20, ajustar o exemplo "a `Wallet` decide saldo insuficiente" à D22/D23, em que quem decide é o banco?
 - `TODO:` confirmar se a tabela `wallets` tem `CHECK (balance >= 0)` como segunda proteção contra saldo negativo.
 - Em aberto: I1, `referenceTransactionId` e `processedAt` em `transactions`.
