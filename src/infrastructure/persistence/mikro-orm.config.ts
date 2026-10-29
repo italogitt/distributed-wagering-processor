@@ -1,13 +1,15 @@
 import { defineConfig } from '@mikro-orm/postgresql';
 import { Migrator } from '@mikro-orm/migrations';
+import { InboxMessageRecord } from './entities/inbox-message.record';
 import { LedgerEntryRecord } from './entities/ledger-entry.record';
+import { OutboxEventRecord } from './entities/outbox-event.record';
 import { TransactionRecord } from './entities/transaction.record';
 import { WalletRecord } from './entities/wallet.record';
 
 export default defineConfig({
   clientUrl: process.env.DATABASE_URL ?? 'postgresql://wallet:wallet@localhost:5432/wallet',
   // Lista explícita: sem glob/discovery mágico, e cada entidade nova entra aqui.
-  entities: [WalletRecord, TransactionRecord, LedgerEntryRecord],
+  entities: [WalletRecord, TransactionRecord, LedgerEntryRecord, InboxMessageRecord, OutboxEventRecord],
   extensions: [Migrator],
   migrations: {
     path: './src/infrastructure/persistence/migrations',

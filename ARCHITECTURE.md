@@ -102,7 +102,32 @@ Não dividi o código por módulo de negócio (wallet, transaction etc.). Quase 
 
 ## Mensageria (inbox/outbox/SQS)
 
-_A preencher._
+### D15. Inbox sem `payloadHash` e sem `processedAt`
+- **Decisão:** a `inbox_messages` (tabela que registra as mensagens do SQS já recebidas, para não processar a mesma duas vezes) não tem `payloadHash` nem `processedAt`. É um desvio consciente do enunciado.
+- **Por quê:** a linha da inbox é gravada no mesmo commit do processamento. Então, se a linha existe, a mensagem já foi processada; não preciso de `processedAt` para saber isso. A comparação de payload fica na idempotência da `transactions`, que é igual para HTTP e SQS.
+- **Trade-off:** a inbox sozinha não detecta uma mensagem com o mesmo id e payload diferente. Quem pega isso é a idempotência da `transactions`. `TODO: outro custo?`
+
+### D16. `message_id` da inbox é o id de negócio da mensagem
+- **Decisão:** o `message_id` da inbox é o id de negócio que vem no corpo da mensagem, não o `MessageId` que o SQS gera.
+- **Por quê:** quando o provedor reenvia a mesma mensagem, o SQS gera um `MessageId` novo. Com ele, a deduplicação não funcionaria.
+- **Trade-off:** `TODO: custo dessa escolha.`
+- **Alternativa descartada:** usar o `MessageId` do SQS.
+
+### D17. `next_attempt_at` na outbox para backoff
+- **Decisão:** a `outbox_events` (tabela onde gravo os eventos na mesma transação do negócio, para publicar no SQS depois) tem `next_attempt_at`. Quando a publicação falha, o evento só é tentado de novo a partir desse horário.
+- **Por quê:** para fazer backoff (esperar um tempo antes de tentar de novo, em vez de repetir na hora).
+- **Trade-off:** `TODO: custo dessa escolha.`
+- `TODO: intervalos do backoff e limite de tentativas.`
+
+### D18. Ordem FIFO por aggregate na outbox
+- **Decisão:** os eventos saem em ordem FIFO (primeiro a entrar, primeiro a sair) por aggregate (a entidade dona do evento, como uma wallet ou uma transação). Um evento só é publicado quando não existe outro mais antigo pendente do mesmo aggregate. A coluna `sequence` define a ordem.
+- **Por quê:** `TODO: por que a ordem por aggregate importa?` Usei `sequence` e não `created_at` porque `created_at` empata entre eventos gravados na mesma transação.
+- **Trade-off:** um evento que fica falhando segura todos os seguintes daquele aggregate.
+
+### D19. Vários publishers com `FOR UPDATE SKIP LOCKED`
+- **Decisão:** posso rodar vários publishers (processos que leem a outbox e publicam no SQS) ao mesmo tempo. Eles buscam eventos com `FOR UPDATE SKIP LOCKED`: cada publisher trava as linhas que pegou, e os outros pulam essas linhas em vez de esperar.
+- **Por quê:** assim cada evento é pego por um publisher só.
+- **Trade-off:** duplicação ainda pode acontecer. Se o processo morrer depois de publicar e antes de marcar `published_at`, o evento é publicado de novo. Trato isso com o `MessageDeduplicationId` do SQS (igual ao id do evento) e com a idempotência de quem consome.
 
 ## Erros e status HTTP
 
@@ -120,7 +145,7 @@ _A preencher._
 
 ### D14. Reset do banco recriando o schema
 - **Decisão:** entre os testes, reseto o banco recriando o schema, não com `TRUNCATE`.
-- **Por quê:** `TODO: motivo (é porque o trigger da D13 recusa TRUNCATE no ledger?)`
+- **Por quê:** o trigger da D13 recusa `TRUNCATE` no ledger, então não dá para limpar o banco com `TRUNCATE`.
 - **Trade-off:** `TODO: custo dessa escolha.`
 
 ## 4. Interpretações do enunciado
@@ -129,8 +154,8 @@ _A preencher._
 |---|---|---|---|
 | I1 | `transactions` no enunciado tem `referenceTransactionId` (id interno) e `processedAt`, que a minha modelagem não tem. | `TODO` | Em aberto |
 | I2 | O replay deve devolver o saldo da época. Mas `LOSS` e `REJECTED` não geram ledger, então não dá para tirar esse saldo do ledger. | Guardo `balance_after` em `transactions` (D12). | Decidido |
-| I3 | `inbox_messages` no enunciado tem `payloadHash` e `processedAt`. | `TODO` | Em aberto |
-| I4 | `outbox_events` no enunciado tem `nextAttemptAt`. | `TODO` | Em aberto |
+| I3 | `inbox_messages` no enunciado tem `payloadHash` e `processedAt`. | Não uso nenhum dos dois. Desvio consciente (D15). | Decidido |
+| I4 | `outbox_events` no enunciado tem `nextAttemptAt`. | Uso `next_attempt_at` para o backoff (D17). | Decidido |
 | I5 | O `WIN` pode trazer uma referência a outra transação? | Pode. Quando vem, valido a referência do mesmo jeito que nas reversões (`REFUND` e `ROLLBACK`, operações que desfazem outra transação). | Decidido |
 | I6 | Quantas vezes uma transação pode ser revertida? | Uma vez no total, somando `REFUND` e `ROLLBACK`. É mais restrito que o enunciado. Sem isso, um `REFUND` mais um `ROLLBACK` da mesma aposta creditariam o valor duas vezes. | Decidido |
 | I7 | Valor do `LOSS`. | Sempre `0`. | Decidido |
@@ -145,7 +170,8 @@ _A preencher._
 - Requisições recusadas por wallet inexistente, player ou moeda diferentes não ficam gravadas. Então não existe registro de idempotência para elas, e um reenvio é validado de novo do zero (I8).
 - `failure_code` é texto livre no banco. A lista de códigos válidos fica só no domínio, então o banco aceitaria qualquer texto.
 - Os triggers do ledger não barram `DROP TABLE`. Quem tem permissão de DDL (comandos que mudam a estrutura do banco, como `CREATE`, `ALTER` e `DROP`) ainda consegue apagar o ledger. Num ambiente real, a aplicação usaria um usuário do banco sem permissão de DDL (D13).
-- O banco não garante que a wallet e a moeda de um lançamento do ledger são as mesmas da transação. O `UNIQUE (wallet_id, transaction_id)` não impede que um bug crie um lançamento numa wallet diferente da transação. Uma FK composta (FK sobre mais de uma coluna ao mesmo tempo) resolveria, mas não usei. `TODO: qual decisão justifica não usar FK composta?`
+- O banco não garante que a wallet e a moeda de um lançamento do ledger são as mesmas da transação. O `UNIQUE (wallet_id, transaction_id)` não impede que um bug crie um lançamento numa wallet diferente da transação. Uma FK composta (FK sobre mais de uma coluna ao mesmo tempo) resolveria, mas não implementei.
+- A ordem FIFO da outbox é por `aggregate_id`. Eventos da wallet (`aggregate_type = 'wallet'`) e da transação (`'transaction'`) ficam em grupos diferentes. Então não há ordem garantida entre `WalletBalanceChanged` e `WagerTransactionProcessed` (D18).
 
 ## 6. Pendências
 
@@ -157,11 +183,12 @@ _A preencher._
 - `TODO:` D11, trade-off de usar o MikroORM.
 - `TODO:` D12, trade-off do `balance_after`.
 - `TODO:` D13, por que garantir a imutabilidade do ledger no banco.
-- `TODO:` D14, motivo e trade-off de resetar o banco recriando o schema.
-- `TODO:` limitação do ledger, qual decisão justifica não usar FK composta.
+- `TODO:` D14, trade-off de resetar o banco recriando o schema.
+- `TODO:` D15, outro custo de tirar `payloadHash` e `processedAt` da inbox.
+- `TODO:` D16, trade-off de usar o id de negócio como `message_id`.
+- `TODO:` D17, trade-off, intervalos do backoff e limite de tentativas da outbox.
+- `TODO:` D18, por que a ordem por aggregate importa.
 - `TODO:` I8, status HTTP exato para wallet inexistente e para player/moeda diferentes.
 - `TODO:` taxonomia de `failureCode`.
 - `TODO:` confirmar se a tabela `wallets` tem `CHECK (balance >= 0)` como segunda proteção contra saldo negativo.
 - Em aberto: I1, `referenceTransactionId` e `processedAt` em `transactions`.
-- Em aberto: I3, `payloadHash` e `processedAt` em `inbox_messages`.
-- Em aberto: I4, `nextAttemptAt` em `outbox_events`.
