@@ -1,9 +1,7 @@
 import { InvalidMoneyError, InvalidWagerTransactionError } from '../../domain/errors';
 import { FailureCode } from '../../domain/failure-code';
 import { Money, type MoneyProps } from '../../domain/money';
-import { WagerTransaction, WagerTransactionKind, WagerTransactionStatus } from '../../domain/wager-transaction';
-import type { Wallet } from '../../domain/wallet';
-import { LedgerDirection } from '../../domain/wallet-ledger-entry';
+import { WagerTransaction, WagerTransactionKind, type WagerTransactionStatus } from '../../domain/wager-transaction';
 import {
   DuplicateMessageError,
   IdempotencyConflictError,
@@ -12,19 +10,12 @@ import {
   WalletMismatchError,
   WalletNotFoundError,
 } from '../errors';
-import {
-  type EventContext,
-  type IntegrationEvent,
-  WagerTransactionPendingReference,
-  WagerTransactionProcessed,
-  WagerTransactionRejected,
-  WalletBalanceChanged,
-} from '../events';
+import { WagerTransactionPendingReference } from '../events';
 import { computePayloadHash } from '../payload-hash';
 import type { IdGenerator } from '../ports/id-generator';
 import type { StoredTransaction } from '../ports/transaction.repository';
 import type { TransactionalRepositories, UnitOfWork } from '../ports/unit-of-work';
-import type { MovementApplied } from '../ports/wallet.repository';
+import { TransactionSettlement } from '../services/transaction-settlement';
 
 export interface SubmitTransactionInput {
   idempotencyKey: string;
@@ -90,10 +81,14 @@ interface ParsedInput {
  * tocam no banco: um payload inválido nem abre transação.
  */
 export class SubmitTransactionUseCase {
+  private readonly settlement: TransactionSettlement;
+
   constructor(
     private readonly uow: UnitOfWork,
     private readonly ids: IdGenerator,
-  ) {}
+  ) {
+    this.settlement = new TransactionSettlement(ids);
+  }
 
   async execute(input: SubmitTransactionInput, options: SubmitTransactionOptions = {}): Promise<SubmitTransactionOutput> {
     const parsed = { ...this.parse(input), inbox: options.inbox };
@@ -194,73 +189,15 @@ export class SubmitTransactionUseCase {
     // 5. Transação em memória (PENDING).
     const tx = this.createTransaction(parsed, now);
 
-    // 6. Referência.
-    let reference: WagerTransaction | undefined;
-    const referenceExternalId = tx.referenceExternalTransactionId;
-    if (referenceExternalId !== undefined) {
-      // Antes de buscar a referência: uma reversão em PENDING_REFERENCE também
-      // ocupa o índice único, e sem esta checagem o retry bateria nele de novo.
-      if (tx.requiresReference() && (await repos.transactions.hasActiveReversal(input.providerId, referenceExternalId))) {
-        tx.reject(FailureCode.AlreadyReversed);
-      } else {
-        const found = await repos.transactions.findByExternalId(input.providerId, referenceExternalId);
-        if (!found || found.status === WagerTransactionStatus.PendingReference) {
-          return this.waitForReference(repos, tx, input, now);
-        }
-        const code = tx.checkReference(found);
-        if (code) {
-          tx.reject(code);
-        } else {
-          reference = found;
-        }
-      }
+    // 6 a 8. Referência, movimento, balance_after e eventos (regras compartilhadas com o worker).
+    const settlement = await this.settlement.settle(repos, tx, { now, correlationId: input.requestId });
+    if (settlement.status === 'WAITING_REFERENCE') {
+      return this.waitForReference(repos, tx, input, now);
     }
-
-    // 7. Movimento de saldo.
-    let movement: MovementApplied | undefined;
-    if (tx.status === WagerTransactionStatus.Pending) {
-      if (tx.affectsBalance()) {
-        const command = {
-          walletId: wallet.id,
-          money: tx.money,
-          transactionId: tx.id,
-          entryId: this.ids.next(),
-          at: now,
-        };
-        if (tx.ledgerDirectionFor(reference) === LedgerDirection.Debit) {
-          const result = await repos.wallets.applyDebit(command);
-          if (result.status === 'INSUFFICIENT_BALANCE') {
-            tx.reject(tx.insufficientFundsCode());
-          } else {
-            movement = result;
-          }
-        } else {
-          movement = await repos.wallets.applyCredit(command);
-        }
-      }
-      if (tx.status === WagerTransactionStatus.Pending) {
-        tx.markProcessed(reference?.id, now);
-      }
-    }
-
-    // 8. balance_after: com movimento, o saldo que o UPDATE devolveu. Sem
-    // movimento (qualquer REJECTED e o LOSS), relê agora: o saldo do passo 4
-    // pode estar velho. Ex.: sem saldo porque outra BET debitou no meio, ou
-    // ALREADY_REVERSED porque a reversão vencedora (com o crédito dela)
-    // commitou entre os passos 4 e 6.
-    const balanceAfter = movement ? movement.wallet.balance : await this.currentBalance(repos, wallet);
+    const { balanceAfter, events } = settlement;
 
     // 9. Estado final + eventos, na mesma transação SQL.
     await repos.transactions.insert({ transaction: tx, balanceAfter });
-    const events: IntegrationEvent<unknown>[] = [];
-    if (tx.status === WagerTransactionStatus.Processed) {
-      events.push(WagerTransactionProcessed.from(tx, balanceAfter, this.eventContext(input, tx, now)));
-      if (movement) {
-        events.push(WalletBalanceChanged.from(movement.wallet, movement.entry, this.eventContext(input, tx, now)));
-      }
-    } else {
-      events.push(WagerTransactionRejected.from(tx, balanceAfter, this.eventContext(input, tx, now)));
-    }
     await repos.outbox.add(events);
 
     return {
@@ -310,7 +247,11 @@ export class SubmitTransactionUseCase {
     const nextAttemptAt = new Date(now.getTime() + FIRST_REFERENCE_RETRY_MS);
     await repos.transactions.insert({ transaction: tx, nextAttemptAt });
     await repos.outbox.add([
-      WagerTransactionPendingReference.from(tx, nextAttemptAt, this.eventContext(input, tx, now)),
+      WagerTransactionPendingReference.from(
+        tx,
+        nextAttemptAt,
+        this.settlement.eventContext(tx, { now, correlationId: input.requestId }),
+      ),
     ]);
     return { transactionId: tx.id, status: tx.status, idempotentReplay: false };
   }
@@ -332,18 +273,5 @@ export class SubmitTransactionUseCase {
       balanceAfter: stored.balanceAfter?.toJSON(),
       idempotentReplay: true,
     };
-  }
-
-  private async currentBalance(repos: TransactionalRepositories, wallet: Wallet): Promise<Money> {
-    const fresh = await repos.wallets.findById(wallet.id);
-    if (!fresh) {
-      // A wallet existia no passo 4 e não há DELETE de wallet: só um bug chega aqui.
-      throw new Error(`Wallet ${wallet.id} sumiu durante a transação`);
-    }
-    return fresh.balance;
-  }
-
-  private eventContext(input: SubmitTransactionInput, tx: WagerTransaction, now: Date): EventContext {
-    return { eventId: this.ids.next(), correlationId: input.requestId, causationId: tx.id, occurredAt: now };
   }
 }

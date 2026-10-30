@@ -1,5 +1,6 @@
 import { SQSClient } from '@aws-sdk/client-sqs';
 import type { SqsConsumerOptions } from '../../interfaces/sqs/sqs-wager-consumer';
+import { type Env, flag, integer, LOCALSTACK_QUEUE_BASE } from '../env';
 
 export interface SqsConfig {
   region: string;
@@ -8,27 +9,13 @@ export interface SqsConfig {
   consumer: SqsConsumerOptions;
 }
 
-type Env = Record<string, string | undefined>;
-
-const LOCALSTACK_QUEUE_BASE = 'http://localhost:4566/000000000000';
-
-function integer(env: Env, name: string, fallback: number): number {
-  const raw = env[name];
-  if (raw === undefined || raw === '') return fallback;
-  const value = Number(raw);
-  if (!Number.isInteger(value) || value < 0) {
-    throw new Error(`${name} deve ser um inteiro >= 0, recebido "${raw}"`);
-  }
-  return value;
-}
-
 /** Tudo vem de env, com defaults para o docker-compose local. */
 export function loadSqsConfig(env: Env = process.env): SqsConfig {
   return {
     region: env.AWS_REGION ?? 'us-east-1',
     endpoint: env.SQS_ENDPOINT ?? 'http://localhost:4566',
     consumer: {
-      enabled: env.SQS_CONSUMER_ENABLED === 'true',
+      enabled: flag(env, 'SQS_CONSUMER_ENABLED'),
       consumerName: env.SQS_CONSUMER_NAME ?? 'wager-transactions',
       queueUrl: env.SQS_WAGER_QUEUE_URL ?? `${LOCALSTACK_QUEUE_BASE}/wager-transactions.fifo`,
       dlqUrl: env.SQS_WAGER_DLQ_URL ?? `${LOCALSTACK_QUEUE_BASE}/wager-transactions-dlq.fifo`,

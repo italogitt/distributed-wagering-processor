@@ -193,3 +193,108 @@ export async function lockWallet(walletId: string): Promise<{ release(): Promise
     },
   };
 }
+
+// ---- outbox
+
+/** Marca como publicados os pendentes que sobraram: o publisher pega a outbox inteira, não só a do teste. */
+export async function discardPendingOutbox(): Promise<void> {
+  await db().execute('update outbox_events set published_at = now() where published_at is null');
+}
+
+export async function pendingOutboxCount(): Promise<number> {
+  const [row] = await db().execute('select count(*)::int as n from outbox_events where published_at is null');
+  return row?.n ?? 0;
+}
+
+export interface OutboxRow {
+  id: string;
+  aggregateId: string;
+  eventType: string;
+  payload: Record<string, unknown>;
+  attempts: number;
+  publishedAt: Date | null;
+  nextAttemptAt: Date;
+  lastError: string | null;
+}
+
+/** Linhas da outbox em ordem de `sequence`, filtradas por aggregate ou pelo walletId do payload. */
+export async function outboxRows(filter: { aggregateId?: string; walletId?: string } = {}): Promise<OutboxRow[]> {
+  const rows = await db().execute(
+    `select id, aggregate_id, event_type, payload, attempts, published_at, next_attempt_at, last_error
+     from outbox_events
+     where (?::uuid is null or aggregate_id = ?::uuid) and (?::text is null or payload->'data'->>'walletId' = ?)
+     order by sequence`,
+    [filter.aggregateId ?? null, filter.aggregateId ?? null, filter.walletId ?? null, filter.walletId ?? null],
+  );
+  return rows.map((r: Record<string, unknown>) => ({
+    id: r.id as string,
+    aggregateId: r.aggregate_id as string,
+    eventType: r.event_type as string,
+    payload: r.payload as Record<string, unknown>,
+    attempts: r.attempts as number,
+    publishedAt: r.published_at === null ? null : new Date(r.published_at as string),
+    nextAttemptAt: new Date(r.next_attempt_at as string),
+    lastError: r.last_error as string | null,
+  }));
+}
+
+/**
+ * Grava eventos direto na outbox, `perAggregate` por aggregate, intercalando
+ * os aggregates (a1, a2, ..., a1, a2, ...): a ordem global de `sequence`
+ * mistura os grupos, como no tráfego real. Devolve os ids na ordem de gravação.
+ */
+export async function insertOutboxEvents(aggregateIds: string[], perAggregate: number): Promise<OutboxRow['id'][]> {
+  const ids: string[] = [];
+  await db().transactional(async (em) => {
+    for (let round = 0; round < perAggregate; round += 1) {
+      for (const aggregateId of aggregateIds) {
+        const eventId = Bun.randomUUIDv7();
+        const payload = {
+          eventId,
+          eventType: 'WalletBalanceChanged',
+          aggregateId,
+          correlationId: `test-${eventId}`,
+          occurredAt: new Date().toISOString(),
+          version: 1,
+          data: { round },
+        };
+        await em.execute(
+          `insert into outbox_events (id, aggregate_type, aggregate_id, event_type, payload)
+           values (?, 'wallet', ?, 'WalletBalanceChanged', ?::jsonb)`,
+          [eventId, aggregateId, JSON.stringify(payload)],
+        );
+        ids.push(eventId);
+      }
+    }
+  });
+  return ids;
+}
+
+// ---- transactions
+
+/** Linha crua da tabela `transactions` (colunas em snake_case, valores como o driver devolve). */
+export async function transactionRow(transactionId: string): Promise<Record<string, unknown>> {
+  const [row] = await db().execute(
+    `select *, amount::text as amount, balance_after::text as balance_after,
+            next_attempt_at::text as next_attempt_at_text
+     from transactions where id = ?`,
+    [transactionId],
+  );
+  if (!row) throw new Error(`transação ${transactionId} não existe`);
+  return row;
+}
+
+export async function countByStatus(walletId: string, status: string): Promise<number> {
+  const [row] = await db().execute('select count(*)::int as n from transactions where wallet_id = ? and status = ?', [
+    walletId,
+    status,
+  ]);
+  return row?.n ?? 0;
+}
+
+/** Tira da fila do worker as PENDING_REFERENCE que sobraram: o worker pega a tabela inteira, não só as do teste. */
+export async function parkPendingReferences(): Promise<void> {
+  await db().execute(
+    "update transactions set next_attempt_at = 'infinity' where status = 'PENDING_REFERENCE'",
+  );
+}

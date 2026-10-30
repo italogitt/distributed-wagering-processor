@@ -7,9 +7,11 @@ import {
   type SQSClient,
 } from '@aws-sdk/client-sqs';
 import type { BeforeApplicationShutdown, OnApplicationBootstrap } from '@nestjs/common';
+import { backoffSeconds } from '../../application/backoff';
 import { ApplicationError, DuplicateMessageError, InvalidInputError } from '../../application/errors';
 import type { SubmitTransactionUseCase } from '../../application/use-cases/submit-transaction.use-case';
-import type { LogFields, Logger } from '../../infrastructure/logging/logger';
+import { errorFields, type LogFields, type Logger } from '../../infrastructure/logging/logger';
+import { settlesWithin, sleep } from '../workers/timing';
 import { parseWagerMessage, type WagerMessage } from './wager-message';
 
 export interface SqsConsumerOptions {
@@ -233,14 +235,14 @@ export class SqsWagerConsumer implements OnApplicationBootstrap, BeforeApplicati
   }
 
   private async retry(message: Message, error: unknown, fields: LogFields, startedAt: number): Promise<MessageResult> {
-    const backoffSeconds = Math.min(2 ** receiveCountOf(message), this.options.backoffMaxSeconds);
+    const delaySeconds = backoffSeconds(receiveCountOf(message), this.options.backoffMaxSeconds);
     if (this.settle(message)) {
       try {
         await this.sqs.send(
           new ChangeMessageVisibilityCommand({
             QueueUrl: this.options.queueUrl,
             ReceiptHandle: message.ReceiptHandle,
-            VisibilityTimeout: backoffSeconds,
+            VisibilityTimeout: delaySeconds,
           }),
         );
       } catch (changeError) {
@@ -249,7 +251,7 @@ export class SqsWagerConsumer implements OnApplicationBootstrap, BeforeApplicati
       }
     }
     const detail = error instanceof Error ? error.name : 'UnknownError';
-    this.log('warn', 'retry', detail, { ...fields, ...errorFields(error), backoffSeconds }, startedAt);
+    this.log('warn', 'retry', detail, { ...fields, ...errorFields(error), backoffSeconds: delaySeconds }, startedAt);
     return this.result(message, 'retry', detail, fields);
   }
 
@@ -318,33 +320,4 @@ export class SqsWagerConsumer implements OnApplicationBootstrap, BeforeApplicati
 
 function receiveCountOf(message: Message): number {
   return Number(message.Attributes?.ApproximateReceiveCount ?? 1);
-}
-
-function errorFields(error: unknown): LogFields {
-  return error instanceof Error
-    ? { errorName: error.name, errorMessage: error.message }
-    : { errorName: 'UnknownError', errorMessage: String(error) };
-}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    signal?.addEventListener('abort', () => {
-      clearTimeout(timer);
-      resolve();
-    });
-  });
-}
-
-/** `true` se a promise terminar dentro do prazo. */
-async function settlesWithin(promise: Promise<unknown> | undefined, ms: number): Promise<boolean> {
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const timeout = new Promise<false>((resolve) => {
-    timer = setTimeout(() => resolve(false), ms);
-  });
-  try {
-    return await Promise.race([Promise.resolve(promise).then(() => true as const), timeout]);
-  } finally {
-    clearTimeout(timer);
-  }
 }

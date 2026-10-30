@@ -30,3 +30,10 @@ export class JsonLogger implements Logger {
     (level === 'error' ? console.error : console.log)(JSON.stringify(line));
   }
 }
+
+/** Campos padrão de erro nos logs: nome e mensagem, nunca o objeto inteiro. */
+export function errorFields(error: unknown): LogFields {
+  return error instanceof Error
+    ? { errorName: error.name, errorMessage: error.message }
+    : { errorName: 'UnknownError', errorMessage: String(error) };
+}

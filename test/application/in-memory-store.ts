@@ -9,11 +9,14 @@ import type {
   ApplyMovementCommand,
 } from '../../src/application/ports/wallet.repository';
 import type { Money } from '../../src/domain/money';
-import { WagerTransactionKind, WagerTransactionStatus } from '../../src/domain/wager-transaction';
+import { WagerTransaction, WagerTransactionKind, WagerTransactionStatus } from '../../src/domain/wager-transaction';
 import { Wallet, type WalletState } from '../../src/domain/wallet';
 import type { WalletLedgerEntry } from '../../src/domain/wallet-ledger-entry';
 
-export interface TransactionRow extends InsertTransactionCommand {}
+export interface TransactionRow extends InsertTransactionCommand {
+  /** Tentativas do worker do PENDING_REFERENCE (0 se ausente). */
+  attempts?: number;
+}
 
 interface State {
   inbox: string[];
@@ -25,6 +28,9 @@ interface State {
 
 const emptyState = (): State => ({ inbox: [], wallets: new Map(), transactions: [], ledger: [], outbox: [] });
 const inboxKey = (consumer: string, messageId: string) => `${consumer}|${messageId}`;
+const notSimulated = async (): Promise<never> => {
+  throw new Error('InMemoryStore não simula o publisher da outbox');
+};
 
 const toState = (wallet: Wallet): WalletState => ({
   id: wallet.id,
@@ -35,6 +41,28 @@ const toState = (wallet: Wallet): WalletState => ({
   createdAt: wallet.createdAt,
   updatedAt: wallet.updatedAt,
 });
+
+/** Cópia independente: o worker muda o estado da transação, e um rollback não pode vazar para o confirmado. */
+const cloneTransaction = (tx: WagerTransaction): WagerTransaction =>
+  WagerTransaction.rehydrate({
+    id: tx.id,
+    providerId: tx.providerId,
+    externalTransactionId: tx.externalTransactionId,
+    idempotencyKey: tx.idempotencyKey,
+    payloadHash: tx.payloadHash,
+    roundId: tx.roundId,
+    gameId: tx.gameId,
+    walletId: tx.walletId,
+    playerId: tx.playerId,
+    kind: tx.kind,
+    money: tx.money,
+    referenceExternalTransactionId: tx.referenceExternalTransactionId,
+    createdAt: tx.createdAt,
+    status: tx.status,
+    referenceTransactionId: tx.referenceTransactionId,
+    failureCode: tx.failureCode,
+    processedAt: tx.processedAt,
+  });
 
 const isActiveReversal = (row: TransactionRow) =>
   (row.transaction.kind === WagerTransactionKind.Refund || row.transaction.kind === WagerTransactionKind.Rollback) &&
@@ -76,8 +104,11 @@ export class InMemoryStore implements UnitOfWork {
   async run<T>(work: (repos: TransactionalRepositories) => Promise<T>): Promise<T> {
     this.runs += 1;
     const working = emptyState();
-    const result = await work(this.repositories(working));
+    // UPDATEs de linhas já existentes (worker do PENDING_REFERENCE), aplicados no commit.
+    const updates = new Map<string, TransactionRow>();
+    const result = await work(this.repositories(working, updates));
     for (const [id, wallet] of working.wallets) this.committed.wallets.set(id, wallet);
+    this.committed.transactions = this.committed.transactions.map((row) => updates.get(row.transaction.id) ?? row);
     this.committed.transactions.push(...working.transactions);
     this.committed.ledger.push(...working.ledger);
     this.committed.outbox.push(...working.outbox);
@@ -85,9 +116,17 @@ export class InMemoryStore implements UnitOfWork {
     return result;
   }
 
-  private repositories(working: State): TransactionalRepositories {
+  private repositories(working: State, updates: Map<string, TransactionRow>): TransactionalRepositories {
     const findWallet = (id: string) => working.wallets.get(id) ?? this.committed.wallets.get(id);
-    const allRows = () => [...this.committed.transactions, ...working.transactions];
+    const allRows = () => [
+      ...this.committed.transactions.map((row) => updates.get(row.transaction.id) ?? row),
+      ...working.transactions,
+    ];
+    const rowOf = (id: string) => {
+      const row = allRows().find((r) => r.transaction.id === id);
+      if (!row) throw new Error(`transação ${id} não existe no InMemoryStore`);
+      return row;
+    };
 
     const move = (command: ApplyMovementCommand, debit: boolean) => {
       const before = Wallet.rehydrate(findWallet(command.walletId)!);
@@ -128,11 +167,12 @@ export class InMemoryStore implements UnitOfWork {
             )?.transaction ?? null
           );
         },
-        hasActiveReversal: async (providerId, referenceExternalId) => {
+        hasActiveReversal: async (providerId, referenceExternalId, excludingTransactionId) => {
           this.beforeHasActiveReversal?.(this);
           return allRows().some(
             (r) =>
               isActiveReversal(r) &&
+              r.transaction.id !== excludingTransactionId &&
               r.transaction.providerId === providerId &&
               r.transaction.referenceExternalTransactionId === referenceExternalId,
           );
@@ -159,11 +199,37 @@ export class InMemoryStore implements UnitOfWork {
           }
           working.transactions.push(command);
         },
+        lockNextDuePendingReference: async () => {
+          const now = Date.now();
+          const [row] = allRows()
+            .filter(
+              (r) =>
+                r.transaction.status === WagerTransactionStatus.PendingReference &&
+                r.nextAttemptAt !== undefined &&
+                r.nextAttemptAt.getTime() <= now,
+            )
+            .sort((a, b) => a.nextAttemptAt!.getTime() - b.nextAttemptAt!.getTime());
+          return row ? { transaction: cloneTransaction(row.transaction), attempts: row.attempts ?? 0 } : null;
+        },
+        reschedulePendingReference: async (transactionId, attempts, nextAttemptAt) => {
+          updates.set(transactionId, { ...rowOf(transactionId), attempts, nextAttemptAt });
+        },
+        update: async ({ transaction, balanceAfter, attempts }) => {
+          rowOf(transaction.id);
+          updates.set(transaction.id, { transaction, balanceAfter, attempts, nextAttemptAt: undefined });
+        },
       },
       outbox: {
         add: async (events) => {
           working.outbox.push(...events);
         },
+        // O publisher tem testes próprios (fake dedicado + integração); este banco falso não o simula.
+        claimPending: notSimulated,
+        markPublished: notSimulated,
+        scheduleRetry: notSimulated,
+        correlationIdOf: async (aggregateId) =>
+          [...this.committed.outbox, ...working.outbox].find((event) => event.aggregateId === aggregateId)
+            ?.correlationId ?? null,
       },
       inbox: {
         exists: async (consumer, messageId) => {

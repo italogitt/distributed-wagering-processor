@@ -17,7 +17,7 @@ import {
   seedWallet,
   walletState,
 } from './support/database';
-import { TEST_DATABASE_URL } from './support/env';
+import { type SpawnedApp, spawnApp, withEnv } from './support/process';
 import {
   createTestQueues,
   deleteTestQueues,
@@ -307,12 +307,13 @@ test(
             work({
               ...repos,
               // Último passo do caso de uso: grava a outbox e só então falha.
-              outbox: {
-                add: async (events) => {
+              // Object.create mantém os outros métodos (do protótipo) do repositório real.
+              outbox: Object.assign(Object.create(repos.outbox), {
+                add: async (events: Parameters<typeof repos.outbox.add>[0]) => {
                   await repos.outbox.add(events);
                   throw new Error('falha forçada antes do commit');
                 },
-              },
+              }),
             }),
           ),
       }),
@@ -339,7 +340,7 @@ describe('9. SIGTERM com mensagem em andamento (processo real: bun src/main.ts)'
     async () => {
       const wallet = await seedWallet('100.00');
       const message = wagerMessage(wallet);
-      const app = await spawnApp({ SQS_SHUTDOWN_TIMEOUT_MS: '10000' });
+      const app = await spawnConsumerApp({ SQS_SHUTDOWN_TIMEOUT_MS: '10000' });
       // Segura o UPDATE da wallet: a mensagem fica "em andamento" de propósito.
       const lock = await lockWallet(wallet.id);
       await send(queues.queueUrl, message);
@@ -367,7 +368,7 @@ describe('9. SIGTERM com mensagem em andamento (processo real: bun src/main.ts)'
     async () => {
       const wallet = await seedWallet('100.00');
       const message = wagerMessage(wallet);
-      const app = await spawnApp({ SQS_SHUTDOWN_TIMEOUT_MS: '1000' });
+      const app = await spawnConsumerApp({ SQS_SHUTDOWN_TIMEOUT_MS: '1000' });
       const lock = await lockWallet(wallet.id);
       await send(queues.queueUrl, message);
       await waitUntil(() => queueDepth(queues.queueUrl), (d) => d.inFlight === 1);
@@ -397,60 +398,16 @@ describe('9. SIGTERM com mensagem em andamento (processo real: bun src/main.ts)'
 
 // ---- utilitários
 
-/** Variáveis de ambiente valem só durante `fn` (a config do SQS é lida ao criar a app). */
-async function withEnv<T>(vars: Record<string, string>, fn: () => Promise<T>): Promise<T> {
-  const previous = Object.fromEntries(Object.keys(vars).map((key) => [key, process.env[key]]));
-  Object.assign(process.env, vars);
-  try {
-    return await fn();
-  } finally {
-    for (const [key, value] of Object.entries(previous)) {
-      if (value === undefined) delete process.env[key];
-      else process.env[key] = value;
-    }
-  }
-}
-
-interface SpawnedApp {
-  process: ReturnType<typeof Bun.spawn>;
-  /** Linhas JSON do stdout (os logs do Nest, que não são JSON, ficam de fora). */
-  logs(): Array<Record<string, unknown>>;
-}
-
 /** Sobe a app de verdade num processo filho, com o consumer ligado nas filas deste teste. */
-async function spawnApp(env: Record<string, string>): Promise<SpawnedApp> {
-  const child = Bun.spawn(['bun', 'src/main.ts'], {
-    env: {
-      ...process.env,
-      DATABASE_URL: TEST_DATABASE_URL,
-      PORT: '0',
+function spawnConsumerApp(env: Record<string, string>): Promise<SpawnedApp> {
+  return spawnApp(
+    {
       SQS_CONSUMER_ENABLED: 'true',
       SQS_WAGER_QUEUE_URL: queues.queueUrl,
       SQS_WAGER_DLQ_URL: queues.dlqUrl,
       SQS_WAIT_TIME_SECONDS: '1',
       ...env,
     },
-    stdout: 'pipe',
-    stderr: 'pipe',
-  });
-  const lines: Array<Record<string, unknown>> = [];
-  void (async () => {
-    const decoder = new TextDecoder();
-    let buffer = '';
-    for await (const chunk of child.stdout as ReadableStream<Uint8Array>) {
-      buffer += decoder.decode(chunk, { stream: true });
-      const parts = buffer.split('\n');
-      buffer = parts.pop() ?? '';
-      for (const part of parts) {
-        try {
-          lines.push(JSON.parse(part));
-        } catch {
-          // log do Nest em texto
-        }
-      }
-    }
-  })();
-  const app = { process: child, logs: () => lines };
-  await waitUntil(async () => lines.some((l) => l.message === 'sqs consumer started'), Boolean, { timeoutMs: 10_000 });
-  return app;
+    ['sqs consumer started'],
+  );
 }

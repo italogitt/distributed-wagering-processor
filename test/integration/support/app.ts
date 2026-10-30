@@ -27,6 +27,26 @@ export interface TransactionBody {
   referenceExternalTransactionId?: string;
 }
 
+/** Corpo de uma transação do provider-a na rodada round-1 (os testes mudam o que precisarem). */
+export function transactionBody(
+  wallet: { id: string; playerId: string; currency: string },
+  kind: string,
+  amount: string,
+  overrides: Partial<TransactionBody> = {},
+): TransactionBody {
+  return {
+    providerId: 'provider-a',
+    externalTransactionId: `ext-${Bun.randomUUIDv7()}`,
+    walletId: wallet.id,
+    playerId: wallet.playerId,
+    roundId: 'round-1',
+    gameId: 'game-1',
+    kind,
+    money: { amount, currency: wallet.currency },
+    ...overrides,
+  };
+}
+
 /** O corpo como chega pela rede: strings, não os enums do domínio. */
 export interface ApiBody {
   transactionId: string;
@@ -43,10 +63,17 @@ export interface ApiResponse {
   body: ApiBody;
 }
 
-export async function submit(baseUrl: string, idempotencyKey: string, body: TransactionBody): Promise<ApiResponse> {
+export async function submit(
+  baseUrl: string,
+  idempotencyKey: string,
+  body: TransactionBody,
+  requestId?: string,
+): Promise<ApiResponse> {
+  const headers: Record<string, string> = { 'content-type': 'application/json', 'idempotency-key': idempotencyKey };
+  if (requestId) headers['x-request-id'] = requestId;
   const response = await fetch(`${baseUrl}/wagering/transactions`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'idempotency-key': idempotencyKey },
+    headers,
     body: JSON.stringify(body),
   });
   return { status: response.status, body: (await response.json()) as ApiBody };
