@@ -298,3 +298,16 @@ export async function parkPendingReferences(): Promise<void> {
     "update transactions set next_attempt_at = 'infinity' where status = 'PENDING_REFERENCE'",
   );
 }
+
+/** Ids do extrato na ordem da API: (created_at, id). */
+export async function ledgerIds(walletId: string): Promise<string[]> {
+  const rows = await db().execute('select id from ledger_entries where wallet_id = ? order by created_at, id', [
+    walletId,
+  ]);
+  return rows.map((r) => r.id as string);
+}
+
+/** Adultera o saldo sem lançamento (só para o teste de reconciliação; o teste desfaz no fim). */
+export async function tamperBalance(walletId: string, delta: string): Promise<void> {
+  await db().execute('update wallets set balance = balance + ?::numeric where id = ?', [delta, walletId]);
+}

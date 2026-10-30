@@ -3,6 +3,8 @@ import {
   ApplicationError,
   IdempotencyConflictError,
   InvalidInputError,
+  TransactionNotFoundError,
+  WalletAlreadyExistsError,
   WalletMismatchError,
   WalletNotFoundError,
 } from '../../application/errors';
@@ -17,7 +19,9 @@ export interface HttpError {
 export function httpErrorFor(error: ApplicationError): HttpError {
   if (error instanceof InvalidInputError) return { status: 400, code: 'INVALID_INPUT' };
   if (error instanceof WalletNotFoundError) return { status: 404, code: 'WALLET_NOT_FOUND' };
+  if (error instanceof TransactionNotFoundError) return { status: 404, code: 'TRANSACTION_NOT_FOUND' };
   if (error instanceof IdempotencyConflictError) return { status: 409, code: error.code };
+  if (error instanceof WalletAlreadyExistsError) return { status: 409, code: error.code };
   if (error instanceof WalletMismatchError) return { status: 422, code: 'WALLET_MISMATCH' };
   // Um ApplicationError novo sem mapeamento é bug nosso, não do cliente.
   return { status: 500, code: 'INTERNAL_ERROR' };

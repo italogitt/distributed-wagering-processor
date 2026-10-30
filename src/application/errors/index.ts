@@ -6,3 +6,5 @@ export { IdempotencyConflictError } from './idempotency-conflict.error';
 export { UniqueViolationError } from './unique-violation.error';
 export { DuplicateMessageError } from './duplicate-message.error';
 export { TransientInfrastructureError } from './transient-infrastructure.error';
+export { WalletAlreadyExistsError } from './wallet-already-exists.error';
+export { TransactionNotFoundError } from './transaction-not-found.error';

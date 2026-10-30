@@ -23,6 +23,12 @@ export interface InsufficientBalance {
   status: 'INSUFFICIENT_BALANCE';
 }
 
+export interface CreateWalletCommand {
+  wallet: Wallet;
+  /** Lançamento CREDIT da abertura; `null` com saldo inicial 0. */
+  openingEntry: WalletLedgerEntry | null;
+}
+
 export type ApplyDebitResult = MovementApplied | InsufficientBalance;
 export type ApplyCreditResult = MovementApplied;
 
@@ -42,6 +48,8 @@ export type ApplyCreditResult = MovementApplied;
  */
 export interface WalletRepository {
   findById(id: string): Promise<Wallet | null>;
+  /** Grava a wallet e o lançamento de abertura. Lança UniqueViolationError se o player já tem wallet na moeda. */
+  create(command: CreateWalletCommand): Promise<void>;
   applyDebit(command: ApplyMovementCommand): Promise<ApplyDebitResult>;
   applyCredit(command: ApplyMovementCommand): Promise<ApplyCreditResult>;
 }

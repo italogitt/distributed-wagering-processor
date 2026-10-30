@@ -151,6 +151,14 @@ export class InMemoryStore implements UnitOfWork {
           return move(command, true);
         },
         applyCredit: async (command): Promise<ApplyCreditResult> => move(command, false),
+        create: async ({ wallet, openingEntry }) => {
+          const all = [...this.committed.wallets.values(), ...working.wallets.values()];
+          if (all.some((w) => w.playerId === wallet.playerId && w.currency === wallet.currency)) {
+            throw new UniqueViolationError('wallets_player_id_currency_uq');
+          }
+          working.wallets.set(wallet.id, toState(wallet));
+          if (openingEntry) working.ledger.push(openingEntry);
+        },
       },
       transactions: {
         findByIdempotencyKey: async (providerId, key): Promise<StoredTransaction | null> => {
@@ -180,7 +188,8 @@ export class InMemoryStore implements UnitOfWork {
         insert: async (command) => {
           this.beforeInsert?.(this);
           const tx = command.transaction;
-          for (const row of allRows()) {
+          // OPENING não tem campos de provedor; no Postgres, NULL não colide em UNIQUE.
+          for (const row of tx.providerId === undefined ? [] : allRows()) {
             const other = row.transaction;
             if (other.providerId !== tx.providerId) continue;
             if (other.idempotencyKey === tx.idempotencyKey) {

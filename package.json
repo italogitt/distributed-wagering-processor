@@ -6,7 +6,7 @@
     "start": "bun src/main.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
-    "test:integration": "bun test --preload ./test/integration/support/setup.ts ./test/integration/*.integration.ts",
+    "test:integration": "LOG_LEVEL=silent bun test --preload ./test/integration/support/setup.ts ./test/integration/*.integration.ts",
     "test:watch": "bun test --watch",
     "orm": "bunx --bun mikro-orm",
     "migration:create": "bunx --bun mikro-orm migration:create",

@@ -27,6 +27,8 @@ export interface Metrics {
   /** UniqueViolation na transação SQL: outra requisição venceu a corrida (dispara o retry do caso de uso). */
   uniqueViolation(): void;
   observeProcessing(source: TransactionSource, seconds: number): void;
+  /** Reconciliação encontrou saldo diferente da soma do ledger. */
+  reconciliationMismatch(): void;
 }
 
 export const NOOP_METRICS: Metrics = {
@@ -36,6 +38,7 @@ export const NOOP_METRICS: Metrics = {
   dlq: () => {},
   uniqueViolation: () => {},
   observeProcessing: () => {},
+  reconciliationMismatch: () => {},
 };
 
 export interface OutboxBacklog {
@@ -94,6 +97,12 @@ export class PrometheusMetrics implements Metrics {
     help: 'Latência de processamento de uma transação, por origem',
     labelNames: ['source'] as const,
     buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
+    registers: [this.registry],
+  });
+
+  private readonly reconciliationMismatches = new Counter({
+    name: 'reconciliation_mismatches_total',
+    help: 'Reconciliações em que o saldo da wallet diferiu da soma do ledger (nada é corrigido)',
     registers: [this.registry],
   });
 
@@ -164,5 +173,9 @@ export class PrometheusMetrics implements Metrics {
 
   observeProcessing(source: TransactionSource, seconds: number): void {
     this.processing.observe({ source }, seconds);
+  }
+
+  reconciliationMismatch(): void {
+    this.reconciliationMismatches.inc();
   }
 }

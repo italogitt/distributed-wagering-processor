@@ -3,20 +3,25 @@ import { EntityManager } from '@mikro-orm/postgresql';
 import { MikroOrmModule } from '@mikro-orm/nestjs';
 import { Inject, Module, type OnApplicationShutdown } from '@nestjs/common';
 import { APP_FILTER } from '@nestjs/core';
+import { CreateWalletUseCase } from './application/use-cases/create-wallet.use-case';
 import { PublishOutboxUseCase } from './application/use-cases/publish-outbox.use-case';
 import { ResolvePendingReferenceUseCase } from './application/use-cases/resolve-pending-reference.use-case';
+import { ReconcileWalletUseCase } from './application/use-cases/reconcile-wallet.use-case';
 import { SubmitTransactionUseCase } from './application/use-cases/submit-transaction.use-case';
+import { WalletQueries } from './application/use-cases/wallet-queries';
 import { errorFields, JsonLogger } from './infrastructure/logging/logger';
 import { MeteredUnitOfWork } from './infrastructure/metrics/metered-unit-of-work';
 import { type Metrics, PrometheusMetrics } from './infrastructure/metrics/metrics';
 import mikroOrmConfig from './infrastructure/persistence/mikro-orm.config';
 import { readOutboxBacklog } from './infrastructure/persistence/outbox-backlog';
 import { MikroOrmUnitOfWork } from './infrastructure/persistence/mikro-orm-unit-of-work';
+import { MikroOrmWalletReadModel } from './infrastructure/persistence/mikro-orm-wallet-read-model';
 import { SqsEventPublisher } from './infrastructure/sqs/sqs-event-publisher';
 import { createSqsClient, loadSqsConfig, type SqsConfig } from './infrastructure/sqs/sqs.config';
 import { UuidV7IdGenerator } from './infrastructure/uuid-v7-id-generator';
 import { loadOutboxPublisherConfig, loadPendingReferenceConfig } from './infrastructure/workers.config';
 import { ApplicationErrorFilter } from './interfaces/http/application-error.filter';
+import { AuthGuard } from './interfaces/http/auth.guard';
 import {
   HEALTH_DEPENDENCIES,
   HealthController,
@@ -24,7 +29,9 @@ import {
   SQS_CLIENT,
 } from './interfaces/http/health.controller';
 import { METRICS, METRICS_REGISTRY, MetricsController } from './interfaces/http/metrics.controller';
+import { TransactionQueryController } from './interfaces/http/transaction-query.controller';
 import { WAGERING_LOGGER, WageringController } from './interfaces/http/wagering.controller';
+import { WALLET_LOGGER, WalletController } from './interfaces/http/wallet.controller';
 import { SqsWagerConsumer } from './interfaces/sqs/sqs-wager-consumer';
 import { OutboxPublisherWorker } from './interfaces/workers/outbox-publisher.worker';
 import { PendingReferenceWorker } from './interfaces/workers/pending-reference.worker';
@@ -36,7 +43,7 @@ const SQS_CONFIG = Symbol('SQS_CONFIG');
     // Sem request context: o UnitOfWork faz `fork()` a cada transação.
     MikroOrmModule.forRoot({ ...mikroOrmConfig, registerRequestContext: false }),
   ],
-  controllers: [WageringController, HealthController, MetricsController],
+  controllers: [WalletController, WageringController, TransactionQueryController, HealthController, MetricsController],
   providers: [
     { provide: APP_FILTER, useClass: ApplicationErrorFilter },
     {
@@ -54,6 +61,23 @@ const SQS_CONFIG = Symbol('SQS_CONFIG');
     { provide: METRICS, useExisting: PrometheusMetrics },
     { provide: METRICS_REGISTRY, inject: [PrometheusMetrics], useFactory: (m: PrometheusMetrics) => m.registry },
     { provide: WAGERING_LOGGER, useFactory: () => new JsonLogger('WageringController') },
+    { provide: WALLET_LOGGER, useFactory: () => new JsonLogger('WalletController') },
+    AuthGuard,
+    {
+      provide: CreateWalletUseCase,
+      inject: [EntityManager],
+      useFactory: (em: EntityManager) => new CreateWalletUseCase(new MikroOrmUnitOfWork(em), new UuidV7IdGenerator()),
+    },
+    {
+      provide: WalletQueries,
+      inject: [EntityManager],
+      useFactory: (em: EntityManager) => new WalletQueries(new MikroOrmWalletReadModel(em)),
+    },
+    {
+      provide: ReconcileWalletUseCase,
+      inject: [EntityManager],
+      useFactory: (em: EntityManager) => new ReconcileWalletUseCase(new MikroOrmWalletReadModel(em)),
+    },
     {
       // O caso de uso não conhece o Nest: a montagem fica aqui.
       provide: SubmitTransactionUseCase,

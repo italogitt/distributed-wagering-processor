@@ -11,6 +11,9 @@ export interface Logger {
  * payload financeiro completo, só ids e o resultado.
  */
 export class JsonLogger implements Logger {
+  /** LOG_LEVEL=silent cala o stdout (info e warn); erros continuam no stderr. Usado pela suíte de integração. */
+  private readonly silent = process.env.LOG_LEVEL === 'silent';
+
   constructor(private readonly context: string) {}
 
   info(message: string, fields: LogFields = {}): void {
@@ -26,6 +29,7 @@ export class JsonLogger implements Logger {
   }
 
   private write(level: string, message: string, fields: LogFields): void {
+    if (this.silent && level !== 'error') return;
     const line = { time: new Date().toISOString(), level, context: this.context, message, ...fields };
     (level === 'error' ? console.error : console.log)(JSON.stringify(line));
   }

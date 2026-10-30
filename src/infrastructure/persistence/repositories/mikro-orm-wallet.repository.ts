@@ -3,10 +3,12 @@ import type {
   ApplyCreditResult,
   ApplyDebitResult,
   ApplyMovementCommand,
+  CreateWalletCommand,
   MovementApplied,
   WalletRepository,
 } from '../../../application/ports/wallet.repository';
 import { Wallet } from '../../../domain/wallet';
+import type { WalletLedgerEntry } from '../../../domain/wallet-ledger-entry';
 import { LedgerEntryRecord } from '../entities/ledger-entry.record';
 import { WalletRecord } from '../entities/wallet.record';
 import { toWallet } from '../mappers/wallet.mapper';
@@ -39,6 +41,22 @@ export class MikroOrmWalletRepository implements WalletRepository {
     // Sem identity map: o saldo precisa vir do banco a cada leitura, não de um cache da requisição.
     const record = await this.em.findOne(WalletRecord, { id }, { disableIdentityMap: true });
     return record ? toWallet(record) : null;
+  }
+
+  async create({ wallet, openingEntry }: CreateWalletCommand): Promise<void> {
+    await this.em.insert(WalletRecord, {
+      id: wallet.id,
+      playerId: wallet.playerId,
+      currency: wallet.currency,
+      balance: wallet.balance.toJSON().amount,
+      version: wallet.version,
+      createdAt: wallet.createdAt,
+      updatedAt: wallet.updatedAt,
+    });
+    // A FK do ledger para transactions é DEFERRABLE: a OPENING pode ser gravada depois, na mesma transação.
+    if (openingEntry) {
+      await this.insertEntry(openingEntry);
+    }
   }
 
   async applyDebit(command: ApplyMovementCommand): Promise<ApplyDebitResult> {
@@ -83,6 +101,12 @@ export class MikroOrmWalletRepository implements WalletRepository {
     const props = { entryId: command.entryId, money: command.money, transactionId: command.transactionId, at: command.at };
     const entry = direction === 'DEBIT' ? wallet.debit(props) : wallet.credit(props);
 
+    await this.insertEntry(entry);
+
+    return { status: 'APPLIED', wallet, entry };
+  }
+
+  private async insertEntry(entry: WalletLedgerEntry): Promise<void> {
     await this.em.insert(LedgerEntryRecord, {
       id: entry.id,
       walletId: entry.walletId,
@@ -94,7 +118,5 @@ export class MikroOrmWalletRepository implements WalletRepository {
       balanceAfter: entry.balanceAfter.toJSON().amount,
       createdAt: entry.createdAt,
     });
-
-    return { status: 'APPLIED', wallet, entry };
   }
 }

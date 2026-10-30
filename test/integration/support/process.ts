@@ -29,7 +29,8 @@ export interface SpawnedApp {
  */
 export async function spawnApp(env: Record<string, string>, readyMessages: string[]): Promise<SpawnedApp> {
   const child = Bun.spawn(['bun', 'src/main.ts'], {
-    env: { ...process.env, DATABASE_URL: TEST_DATABASE_URL, PORT: '0', ...env },
+    // LOG_LEVEL=info: os logs do filho são lidos para saber quando ele está pronto.
+    env: { ...process.env, DATABASE_URL: TEST_DATABASE_URL, PORT: '0', LOG_LEVEL: 'info', ...env },
     stdout: 'pipe',
     stderr: 'pipe',
   });

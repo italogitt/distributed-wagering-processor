@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { Body, Controller, Headers, HttpCode, Inject, Post, Res } from '@nestjs/common';
+import { Body, Controller, Headers, HttpCode, Inject, Post, Res, UseGuards } from '@nestjs/common';
 import { SubmitTransactionUseCase } from '../../application/use-cases/submit-transaction.use-case';
 import type { LogFields, Logger } from '../../infrastructure/logging/logger';
 import type { Metrics } from '../../infrastructure/metrics/metrics';
+import { AuthGuard } from './auth.guard';
 import type { HttpResponse } from './http-response';
 import { METRICS } from './metrics.controller';
 import {
@@ -15,6 +16,7 @@ import {
 export const WAGERING_LOGGER = Symbol('WAGERING_LOGGER');
 
 @Controller('wagering')
+@UseGuards(AuthGuard)
 export class WageringController {
   // @Inject explícito: não depende do metadata de tipos emitido pelo compilador.
   constructor(
