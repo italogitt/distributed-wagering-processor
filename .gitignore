@@ -23,5 +23,5 @@ logs/
 !.vscode/extensions.json
 !.vscode/settings.json
 
-# snapshot do migrator gerado contra bancos de teste
-.snapshot-wallet_test*.json
+# snapshots do migrator gerados contra outros bancos (o .snapshot-wallet.json do dev é versionado)
+.snapshot-wallet_*.json

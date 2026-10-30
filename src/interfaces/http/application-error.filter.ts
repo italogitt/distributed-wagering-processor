@@ -4,6 +4,7 @@ import {
   IdempotencyConflictError,
   InvalidInputError,
   TransactionNotFoundError,
+  TransientInfrastructureError,
   WalletAlreadyExistsError,
   WalletMismatchError,
   WalletNotFoundError,
@@ -16,7 +17,9 @@ export interface HttpError {
   code: string;
 }
 
-export function httpErrorFor(error: ApplicationError): HttpError {
+export function httpErrorFor(error: ApplicationError | TransientInfrastructureError): HttpError {
+  // Banco indisponível, timeout ou deadlock: nada foi gravado, o provedor reenvia com a mesma key.
+  if (error instanceof TransientInfrastructureError) return { status: 503, code: 'SERVICE_UNAVAILABLE' };
   if (error instanceof InvalidInputError) return { status: 400, code: 'INVALID_INPUT' };
   if (error instanceof WalletNotFoundError) return { status: 404, code: 'WALLET_NOT_FOUND' };
   if (error instanceof TransactionNotFoundError) return { status: 404, code: 'TRANSACTION_NOT_FOUND' };
@@ -28,12 +31,12 @@ export function httpErrorFor(error: ApplicationError): HttpError {
 }
 
 /**
- * Traduz os erros do caso de uso para HTTP. Erros que não são
- * ApplicationError (ex.: banco fora do ar) seguem para o handler padrão do Nest (500).
+ * Traduz os erros do caso de uso para HTTP. Falha transitória vira 503; os
+ * demais erros (bugs) seguem para o handler padrão do Nest (500).
  */
-@Catch(ApplicationError)
-export class ApplicationErrorFilter implements ExceptionFilter<ApplicationError> {
-  catch(error: ApplicationError, host: ArgumentsHost): void {
+@Catch(ApplicationError, TransientInfrastructureError)
+export class ApplicationErrorFilter implements ExceptionFilter<ApplicationError | TransientInfrastructureError> {
+  catch(error: ApplicationError | TransientInfrastructureError, host: ArgumentsHost): void {
     const { status, code } = httpErrorFor(error);
     host.switchToHttp().getResponse<HttpResponse>().status(status).json({ error: code, message: error.message });
   }

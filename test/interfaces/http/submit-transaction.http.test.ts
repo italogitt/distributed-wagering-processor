@@ -3,6 +3,7 @@ import {
   ApplicationError,
   IdempotencyConflictError,
   InvalidInputError,
+  TransientInfrastructureError,
   WalletMismatchError,
   WalletNotFoundError,
 } from '../../../src/application/errors';
@@ -119,6 +120,7 @@ describe('httpErrorFor', () => {
     [new WalletNotFoundError('w'), 404, 'WALLET_NOT_FOUND'],
     [new IdempotencyConflictError('x'), 409, 'IDEMPOTENCY_CONFLICT'],
     [new WalletMismatchError('x'), 422, 'WALLET_MISMATCH'],
+    [new TransientInfrastructureError('x'), 503, 'SERVICE_UNAVAILABLE'],
   ])('%p → %i', (error, status, code) => {
     expect(httpErrorFor(error)).toEqual({ status, code });
   });

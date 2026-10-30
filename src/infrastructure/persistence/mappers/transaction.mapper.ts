@@ -20,7 +20,8 @@ export function toWagerTransaction(record: TransactionRecord): WagerTransaction 
     gameId: record.gameId ?? undefined,
     walletId: record.walletId,
     playerId: record.playerId,
-    // O CHECK do banco garante que kind/status/failure_code estão nas listas do domínio.
+    // CHECKs do banco garantem que kind/status estão nas listas do domínio. failure_code não:
+    // o CHECK só exige que exista em REJECTED/FAILED; o valor é texto livre (lista só no domínio).
     kind: record.kind as WagerTransactionKind,
     status: record.status as WagerTransactionStatus,
     money: Money.from({ amount: record.amount, currency: record.currency }),

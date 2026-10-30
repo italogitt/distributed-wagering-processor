@@ -153,7 +153,8 @@ Não dividi o código por módulo de negócio (wallet, transaction etc.). Quase 
 | 404 | Wallet ou transação inexistente (id fora do formato também). | `WALLET_NOT_FOUND`, `TRANSACTION_NOT_FOUND` |
 | 409 | Mesma key com outro payload, ou `externalTransactionId` com outra key; wallet duplicada. | `IDEMPOTENCY_CONFLICT`, `WALLET_ALREADY_EXISTS` |
 | 422 | Wallet de outro player ou de outra moeda. | `WALLET_MISMATCH` |
-| 500 | Falha de infraestrutura ou bug. | Padrão do Nest |
+| 503 | Falha transitória de infraestrutura (banco fora do ar, timeout, deadlock). Nada foi gravado. | `SERVICE_UNAVAILABLE` |
+| 500 | Bug. | Padrão do Nest |
 
 Nada é gravado em 400, 404, 409 e 422. `/health/ready` responde 503 quando o Postgres ou o SQS não respondem.
 
@@ -170,7 +171,7 @@ Vêm no campo `failureCode` de uma transação `REJECTED` (HTTP 200). Reenviar a
 | `ALREADY_REVERSED` | A referência já tem um REFUND ou ROLLBACK ativo. | Desistir: o efeito já aconteceu. |
 | `AMOUNT_MISMATCH` | Valor da reversão diferente do valor da referência. | Corrigir o valor. |
 
-Erros sem `failureCode` (seção 4): 400, 404, 409 e 422 → corrigir; 500 → reenviar com a mesma key.
+Erros sem `failureCode` (seção 4): 400, 404, 409 e 422 → corrigir; 503 → reenviar com a mesma key, com backoff; 500 → reenviar com a mesma key.
 
 ## 6. Autenticação
 
@@ -208,7 +209,6 @@ Ponto de extensão: `src/interfaces/http/auth.guard.ts`, um `AuthGuard` no-op ap
 - **`conditional_debit_rejected` não distingue corrida:** uma BET sem saldo, sem ninguém concorrendo, também conta.
 - **Métricas por instância:** cada `/metrics` mostra só a sua instância. Agregar é papel do Prometheus.
 - **Brecha do keyset:** o `created_at` do ledger vem do relógio da app. Uma transação que pegou o horário antes e commitou depois de uma página já lida fica fora da paginação.
-- **Falha transitória no HTTP responde 500**, igual a um bug. O consumer distingue os dois; o HTTP ainda não.
 - **Erros de negócio do SQS (404/409/422) sem linha na inbox:** o rollback desfaz a inbox. Uma redelivery reprocessa e chega à mesma decisão, sem efeito.
 - **Sem teste de carga e sem autenticação** (seção 6).
 - **Listas só no domínio:** o CHECK de moeda confere só o formato `^[A-Z]{3}$` (D7), e `failure_code` é texto livre (o CHECK só exige que exista em `REJECTED`/`FAILED`). Quem grava sem passar pelo `Money` sofre o arredondamento silencioso do Postgres (`1.005` vira `1.01`).
