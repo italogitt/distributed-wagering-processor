@@ -1,3 +1,4 @@
+import { DeferMode } from '@mikro-orm/core';
 import { Check, Entity, Index, ManyToOne, PrimaryKey, Property, Trigger, Unique } from '@mikro-orm/decorators/legacy';
 import { TransactionRecord } from './transaction.record';
 import { WalletRecord } from './wallet.record';
@@ -50,12 +51,15 @@ export class LedgerEntryRecord {
   })
   walletId!: string;
 
+  // DEFERRED: o lançamento é gravado antes da linha da transação, na mesma
+  // transação SQL; a FK é conferida no COMMIT.
   @Index({ name: 'ledger_entries_transaction_id_idx' })
   @ManyToOne(() => TransactionRecord, {
     mapToPk: true,
     fieldName: 'transaction_id',
     deleteRule: 'restrict',
     updateRule: 'restrict',
+    deferMode: DeferMode.INITIALLY_DEFERRED,
   })
   transactionId!: string;
 

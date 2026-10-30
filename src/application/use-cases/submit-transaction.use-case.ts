@@ -138,16 +138,22 @@ export class SubmitTransactionUseCase {
     // 3. Idempotência.
     const existing = await repos.transactions.findByIdempotencyKey(input.providerId, input.idempotencyKey);
     if (existing) {
-      if (!existing.transaction.matchesPayload(parsed.payloadHash)) {
-        throw new IdempotencyConflictError(`idempotencyKey ${input.idempotencyKey} já usada com outro payload`);
-      }
-      return this.replay(existing);
+      return this.replayOrConflict(existing, parsed);
     }
     const sameExternalId = await repos.transactions.findByExternalId(input.providerId, input.externalTransactionId);
     if (sameExternalId) {
-      throw new IdempotencyConflictError(
-        `externalTransactionId ${input.externalTransactionId} já usado com outra idempotencyKey`,
-      );
+      if (sameExternalId.idempotencyKey !== input.idempotencyKey) {
+        throw new IdempotencyConflictError(
+          `externalTransactionId ${input.externalTransactionId} já usado com outra idempotencyKey`,
+        );
+      }
+      // Mesma key: a mesma requisição commitou entre as duas leituras (em READ
+      // COMMITTED cada SELECT vê um snapshot novo). Relê pela key para o replay.
+      const winner = await repos.transactions.findByIdempotencyKey(input.providerId, input.idempotencyKey);
+      if (!winner) {
+        throw new Error(`Transação ${sameExternalId.id} sumiu entre duas leituras`);
+      }
+      return this.replayOrConflict(winner, parsed);
     }
 
     // 4. Wallet. Nada é gravado se falhar (I8).
@@ -282,6 +288,13 @@ export class SubmitTransactionUseCase {
       WagerTransactionPendingReference.from(tx, nextAttemptAt, this.eventContext(input, tx, now)),
     ]);
     return { transactionId: tx.id, status: tx.status, idempotentReplay: false };
+  }
+
+  private replayOrConflict(stored: StoredTransaction, parsed: ParsedInput): SubmitTransactionOutput {
+    if (!stored.transaction.matchesPayload(parsed.payloadHash)) {
+      throw new IdempotencyConflictError(`idempotencyKey ${parsed.input.idempotencyKey} já usada com outro payload`);
+    }
+    return this.replay(stored);
   }
 
   /** Devolve o resultado original, sem mudar nada (regra 7). */

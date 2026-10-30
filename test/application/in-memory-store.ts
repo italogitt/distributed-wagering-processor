@@ -47,14 +47,17 @@ const isActiveReversal = (row: TransactionRow) =>
 /**
  * Banco falso para testes unitários do caso de uso. Cada `run` trabalha numa
  * cópia do estado confirmado: se o callback lança, a cópia é descartada
- * (rollback). Os índices únicos são checados contra a cópia E o confirmado,
- * como o Postgres faz com linhas de outras transações já commitadas.
+ * (rollback). As leituras de `transactions` e os índices únicos enxergam a
+ * cópia E o confirmado, como o Postgres em READ COMMITTED enxerga linhas que
+ * outras transações commitaram depois que a nossa começou.
  */
 export class InMemoryStore implements UnitOfWork {
   committed: State = { wallets: new Map(), transactions: [], ledger: [], outbox: [] };
   runs = 0;
   /** Chamado antes de cada insert; simula outra requisição commitando no meio. */
   beforeInsert?: (store: InMemoryStore) => void;
+  /** Chamado antes de cada findByExternalId; mesma ideia, entre as leituras do passo 3. */
+  beforeFindByExternalId?: (store: InMemoryStore) => void;
 
   addWallet(wallet: Wallet): void {
     this.committed.wallets.set(wallet.id, toState(wallet));
@@ -106,17 +109,21 @@ export class InMemoryStore implements UnitOfWork {
       },
       transactions: {
         findByIdempotencyKey: async (providerId, key): Promise<StoredTransaction | null> => {
-          const row = working.transactions.find(
+          const row = allRows().find(
             (r) => r.transaction.providerId === providerId && r.transaction.idempotencyKey === key,
           );
           return row ? { transaction: row.transaction, balanceAfter: row.balanceAfter } : null;
         },
-        findByExternalId: async (providerId, externalId) =>
-          working.transactions.find(
-            (r) => r.transaction.providerId === providerId && r.transaction.externalTransactionId === externalId,
-          )?.transaction ?? null,
+        findByExternalId: async (providerId, externalId) => {
+          this.beforeFindByExternalId?.(this);
+          return (
+            allRows().find(
+              (r) => r.transaction.providerId === providerId && r.transaction.externalTransactionId === externalId,
+            )?.transaction ?? null
+          );
+        },
         hasActiveReversal: async (providerId, referenceExternalId) =>
-          working.transactions.some(
+          allRows().some(
             (r) =>
               isActiveReversal(r) &&
               r.transaction.providerId === providerId &&

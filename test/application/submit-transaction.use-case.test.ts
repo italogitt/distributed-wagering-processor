@@ -321,6 +321,27 @@ describe('passo 6: referência', () => {
 });
 
 describe('passo 10: corrida e retry', () => {
+  /** A transação que "outra requisição" igual já commitou. */
+  const winner = () => ({
+    transaction: WagerTransaction.rehydrate({
+      id: 'vencedora',
+      providerId: 'provider-a',
+      externalTransactionId: 'tx-1',
+      idempotencyKey: 'provider-a:tx-1',
+      payloadHash: computePayloadHash({ ...input(), amount: '10.00', currency: 'BRL' }),
+      walletId: 'wallet-1',
+      playerId: 'player-1',
+      roundId: 'round-1',
+      gameId: 'game-1',
+      kind: Kind.Bet,
+      money: brl('10.00'),
+      createdAt: OPENED_AT,
+      status: Status.Processed,
+      processedAt: OPENED_AT,
+    }),
+    balanceAfter: brl('90.00'),
+  });
+
   test('outro envio igual commita no meio → rollback, retry acha a linha e devolve replay; 1 débito', async () => {
     givenWallet('100.00');
     // Na primeira tentativa, logo antes do nosso INSERT, "outra requisição"
@@ -328,25 +349,7 @@ describe('passo 10: corrida e retry', () => {
     store.beforeInsert = (s) => {
       s.beforeInsert = undefined;
       s.committed.wallets.get('wallet-1')!.balance = brl('90.00');
-      s.addTransaction({
-        transaction: WagerTransaction.rehydrate({
-          id: 'vencedora',
-          providerId: 'provider-a',
-          externalTransactionId: 'tx-1',
-          idempotencyKey: 'provider-a:tx-1',
-          payloadHash: computePayloadHash({ ...input(), amount: '10.00', currency: 'BRL' }),
-          walletId: 'wallet-1',
-          playerId: 'player-1',
-          roundId: 'round-1',
-          gameId: 'game-1',
-          kind: Kind.Bet,
-          money: brl('10.00'),
-          createdAt: OPENED_AT,
-          status: Status.Processed,
-          processedAt: OPENED_AT,
-        }),
-        balanceAfter: brl('90.00'),
-      });
+      s.addTransaction(winner());
     };
 
     const result = await useCase.execute(input());
@@ -357,6 +360,25 @@ describe('passo 10: corrida e retry', () => {
     expect(balance()).toBe('90.00');
     expect(store.committed.transactions).toHaveLength(1);
     expect(store.committed.ledger).toHaveLength(0); // o nosso débito foi desfeito no rollback
+  });
+
+  test('envio igual commita entre as duas leituras do passo 3 → replay, não 409', async () => {
+    givenWallet('100.00');
+    // findByIdempotencyKey não acha nada; a outra requisição commita; o
+    // findByExternalId acha a linha dela, com a MESMA key.
+    store.beforeFindByExternalId = (s) => {
+      s.beforeFindByExternalId = undefined;
+      s.committed.wallets.get('wallet-1')!.balance = brl('90.00');
+      s.addTransaction(winner());
+    };
+
+    const result = await useCase.execute(input());
+
+    expect(store.runs).toBe(1);
+    expect(result.transactionId).toBe('vencedora');
+    expect(result.idempotentReplay).toBe(true);
+    expect(result.balanceAfter).toEqual({ amount: '90.00', currency: 'BRL' });
+    expect(store.committed.ledger).toHaveLength(0);
   });
 
   test('violou de novo na segunda tentativa → UniqueViolationError sobe, sem loop', async () => {

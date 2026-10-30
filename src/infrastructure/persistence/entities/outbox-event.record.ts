@@ -1,3 +1,4 @@
+import type { Opt } from '@mikro-orm/core';
 import { Check, Entity, Index, PrimaryKey, Property } from '@mikro-orm/decorators/legacy';
 
 /**
@@ -38,8 +39,9 @@ export class OutboxEventRecord {
 
   // Gerado pelo banco na ordem de inserção. Define a ordem FIFO dentro do aggregate.
   // O MikroORM hidrata `bigint` como `bigint` do JS (não é dinheiro, então tudo bem).
+  // `Opt`: o INSERT não informa o valor, quem gera é o bigserial.
   @Property({ type: 'bigint', autoincrement: true, unique: 'outbox_events_sequence_uq' })
-  sequence!: bigint;
+  sequence!: Opt<bigint>;
 
   @Property({ type: 'text' })
   aggregateType!: string;
