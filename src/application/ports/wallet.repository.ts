@@ -27,7 +27,8 @@ export type ApplyDebitResult = MovementApplied | InsufficientBalance;
 export type ApplyCreditResult = MovementApplied;
 
 /**
- * Porta de escrita do saldo. Cada método faz, na transação SQL corrente:
+ * Porta do saldo. `findById` só lê. `applyDebit`/`applyCredit` fazem, na
+ * transação SQL corrente:
  *
  * 1. `UPDATE wallets SET balance = balance ∓ :valor, version = version + 1 ...
  *    WHERE id = :id [AND balance >= :valor] RETURNING *` (D10);
@@ -40,6 +41,7 @@ export type ApplyCreditResult = MovementApplied;
  * Por isso ele volta como resultado, e não como exceção.
  */
 export interface WalletRepository {
+  findById(id: string): Promise<Wallet | null>;
   applyDebit(command: ApplyMovementCommand): Promise<ApplyDebitResult>;
   applyCredit(command: ApplyMovementCommand): Promise<ApplyCreditResult>;
 }
