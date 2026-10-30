@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, test } from 'bun:test';
 import {
+  DuplicateMessageError,
   IdempotencyConflictError,
   InvalidInputError,
   UniqueViolationError,
@@ -295,6 +296,47 @@ describe('passo 6: referência', () => {
     expect(balance()).toBe('100.00');
   });
 
+  test('reversão vencedora commita entre os passos 4 e 6 → ALREADY_REVERSED com o saldo de depois do crédito', async () => {
+    givenWallet('90.00');
+    givenStored(Kind.Bet, 'bet-1');
+    // Nosso passo 4 já leu 90.00. Antes do passo 6, outro ROLLBACK da mesma
+    // BET commita: a reversão E o crédito dela, juntos.
+    store.beforeHasActiveReversal = (s) => {
+      s.beforeHasActiveReversal = undefined;
+      s.committed.wallets.get('wallet-1')!.balance = brl('100.00');
+      s.addTransaction({
+        transaction: WagerTransaction.rehydrate({
+          id: 'rollback-vencedor',
+          providerId: 'provider-a',
+          externalTransactionId: 'rollback-1',
+          idempotencyKey: 'provider-a:rollback-1',
+          payloadHash: 'hash-do-vencedor',
+          walletId: 'wallet-1',
+          playerId: 'player-1',
+          roundId: 'round-1',
+          gameId: 'game-1',
+          kind: Kind.Rollback,
+          money: brl('10.00'),
+          referenceExternalTransactionId: 'bet-1',
+          referenceTransactionId: 'stored-bet-1',
+          createdAt: OPENED_AT,
+          status: Status.Processed,
+          processedAt: OPENED_AT,
+        }),
+        balanceAfter: brl('100.00'),
+      });
+    };
+
+    const result = await useCase.execute(refund());
+
+    expect(result.status).toBe(Status.Rejected);
+    expect(result.failureCode).toBe(FailureCode.AlreadyReversed);
+    expect(result.balanceAfter).toEqual({ amount: '100.00', currency: 'BRL' }); // não os 90.00 do passo 4
+    const stored = store.committed.transactions.find((r) => r.transaction.id === result.transactionId)!;
+    expect(stored.balanceAfter?.toJSON().amount).toBe('100.00');
+    expect(balance()).toBe('100.00');
+  });
+
   test('segundo REFUND com a referência ainda ausente → ALREADY_REVERSED (não bate no índice)', async () => {
     givenWallet('90.00');
     await useCase.execute(refund());
@@ -398,5 +440,65 @@ describe('passo 10: corrida e retry', () => {
     };
     await expect(useCase.execute(input())).rejects.toThrow('conexão caiu');
     expect(store.runs).toBe(1);
+  });
+});
+
+describe('inbox (entrada pela fila)', () => {
+  const inbox = { consumer: 'wager-transactions', messageId: 'msg-1' };
+
+  test('mensagem nova → efeito e linha na inbox commitados juntos', async () => {
+    givenWallet('100.00');
+    const result = await useCase.execute(input(), { inbox });
+
+    expect(result.status).toBe(Status.Processed);
+    expect(store.committed.inbox).toEqual(['wager-transactions|msg-1']);
+    expect(balance()).toBe('90.00');
+  });
+
+  test('mensagem já na inbox → DuplicateMessageError, nada gravado', async () => {
+    givenWallet('100.00');
+    await useCase.execute(input(), { inbox });
+    const runsBefore = store.runs;
+
+    await expect(useCase.execute(input({ externalTransactionId: 'tx-2' }), { inbox })).rejects.toThrow(
+      DuplicateMessageError,
+    );
+    expect(store.runs).toBe(runsBefore + 1); // sem retry
+    expect(store.committed.transactions).toHaveLength(1);
+    expect(balance()).toBe('90.00');
+  });
+
+  test('mesma mensagem commita em outro consumer entre exists e add → retry checa a inbox primeiro → duplicate', async () => {
+    givenWallet('100.00');
+    store.beforeInboxAdd = (s) => {
+      s.beforeInboxAdd = undefined;
+      s.committed.inbox.push('wager-transactions|msg-1');
+    };
+
+    await expect(useCase.execute(input(), { inbox })).rejects.toThrow(DuplicateMessageError);
+    expect(store.runs).toBe(2);
+    expect(store.committed.transactions).toHaveLength(0);
+    expect(balance()).toBe('100.00');
+  });
+
+  test('outro messageId com a mesma idempotencyKey → replay, e a inbox registra a mensagem', async () => {
+    givenWallet('100.00');
+    const first = await useCase.execute(input(), { inbox });
+    const second = await useCase.execute(input(), { inbox: { ...inbox, messageId: 'msg-2' } });
+
+    expect(second).toEqual({ ...first, idempotentReplay: true });
+    expect(store.committed.inbox).toEqual(['wager-transactions|msg-1', 'wager-transactions|msg-2']);
+    expect(balance()).toBe('90.00');
+  });
+
+  test('erro de negócio (404) → rollback leva a linha da inbox junto', async () => {
+    await expect(useCase.execute(input(), { inbox })).rejects.toThrow(WalletNotFoundError);
+    expect(store.committed.inbox).toEqual([]);
+  });
+
+  test('sem inbox (HTTP) → a inbox não é tocada', async () => {
+    givenWallet('100.00');
+    await useCase.execute(input());
+    expect(store.committed.inbox).toEqual([]);
   });
 });

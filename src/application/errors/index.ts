@@ -4,3 +4,5 @@ export { WalletNotFoundError } from './wallet-not-found.error';
 export { WalletMismatchError } from './wallet-mismatch.error';
 export { IdempotencyConflictError } from './idempotency-conflict.error';
 export { UniqueViolationError } from './unique-violation.error';
+export { DuplicateMessageError } from './duplicate-message.error';
+export { TransientInfrastructureError } from './transient-infrastructure.error';

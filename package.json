@@ -6,18 +6,20 @@
     "start": "bun src/main.ts",
     "typecheck": "tsc --noEmit",
     "test": "bun test",
+    "test:integration": "bun test --preload ./test/integration/support/setup.ts ./test/integration/*.integration.ts",
     "test:watch": "bun test --watch",
     "orm": "bunx --bun mikro-orm",
     "migration:create": "bunx --bun mikro-orm migration:create",
     "migration:up": "bunx --bun mikro-orm migration:up",
     "migration:down": "bunx --bun mikro-orm migration:down",
     "migration:check": "bunx --bun mikro-orm migration:check",
-    "db:up": "docker compose up -d postgres"
+    "db:up": "docker compose up -d --wait postgres localstack"
   },
   "mikro-orm": {
     "configPaths": ["./src/infrastructure/persistence/mikro-orm.config.ts"]
   },
   "dependencies": {
+    "@aws-sdk/client-sqs": "3.1160.0",
     "@mikro-orm/core": "7.2.5",
     "@mikro-orm/decorators": "7.2.5",
     "@mikro-orm/migrations": "7.2.5",

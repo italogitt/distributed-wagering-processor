@@ -16,18 +16,15 @@ import type { WalletLedgerEntry } from '../../src/domain/wallet-ledger-entry';
 export interface TransactionRow extends InsertTransactionCommand {}
 
 interface State {
+  inbox: string[];
   wallets: Map<string, WalletState>;
   transactions: TransactionRow[];
   ledger: WalletLedgerEntry[];
   outbox: IntegrationEvent<unknown>[];
 }
 
-const clone = (state: State): State => ({
-  wallets: new Map([...state.wallets].map(([id, wallet]) => [id, { ...wallet }])),
-  transactions: [...state.transactions],
-  ledger: [...state.ledger],
-  outbox: [...state.outbox],
-});
+const emptyState = (): State => ({ inbox: [], wallets: new Map(), transactions: [], ledger: [], outbox: [] });
+const inboxKey = (consumer: string, messageId: string) => `${consumer}|${messageId}`;
 
 const toState = (wallet: Wallet): WalletState => ({
   id: wallet.id,
@@ -45,19 +42,24 @@ const isActiveReversal = (row: TransactionRow) =>
   row.transaction.status !== WagerTransactionStatus.Failed;
 
 /**
- * Banco falso para testes unitários do caso de uso. Cada `run` trabalha numa
- * cópia do estado confirmado: se o callback lança, a cópia é descartada
- * (rollback). As leituras de `transactions` e os índices únicos enxergam a
- * cópia E o confirmado, como o Postgres em READ COMMITTED enxerga linhas que
- * outras transações commitaram depois que a nossa começou.
+ * Banco falso para testes unitários do caso de uso. Cada `run` guarda só as
+ * próprias escritas (`working`): se o callback lança, elas são descartadas
+ * (rollback); se termina, são mescladas no confirmado (commit). As leituras
+ * enxergam as escritas da própria transação E o confirmado do momento, como
+ * o Postgres em READ COMMITTED enxerga o que outras transações commitaram
+ * depois que a nossa começou (os hooks simulam esses commits).
  */
 export class InMemoryStore implements UnitOfWork {
-  committed: State = { wallets: new Map(), transactions: [], ledger: [], outbox: [] };
+  committed: State = emptyState();
   runs = 0;
   /** Chamado antes de cada insert; simula outra requisição commitando no meio. */
   beforeInsert?: (store: InMemoryStore) => void;
   /** Chamado antes de cada findByExternalId; mesma ideia, entre as leituras do passo 3. */
   beforeFindByExternalId?: (store: InMemoryStore) => void;
+  /** Chamado antes de cada hasActiveReversal; simula a reversão vencedora commitando entre os passos 4 e 6. */
+  beforeHasActiveReversal?: (store: InMemoryStore) => void;
+  /** Chamado antes de cada inbox.add; simula a mesma mensagem commitando em outro consumer. */
+  beforeInboxAdd?: (store: InMemoryStore) => void;
 
   addWallet(wallet: Wallet): void {
     this.committed.wallets.set(wallet.id, toState(wallet));
@@ -73,15 +75,19 @@ export class InMemoryStore implements UnitOfWork {
 
   async run<T>(work: (repos: TransactionalRepositories) => Promise<T>): Promise<T> {
     this.runs += 1;
-    const working = clone(this.committed);
+    const working = emptyState();
     const result = await work(this.repositories(working));
-    this.committed = working;
+    for (const [id, wallet] of working.wallets) this.committed.wallets.set(id, wallet);
+    this.committed.transactions.push(...working.transactions);
+    this.committed.ledger.push(...working.ledger);
+    this.committed.outbox.push(...working.outbox);
+    this.committed.inbox.push(...working.inbox);
     return result;
   }
 
   private repositories(working: State): TransactionalRepositories {
-    const findWallet = (id: string) => working.wallets.get(id);
-    const allRows = () => [...working.transactions, ...this.committed.transactions.filter((r) => !working.transactions.includes(r))];
+    const findWallet = (id: string) => working.wallets.get(id) ?? this.committed.wallets.get(id);
+    const allRows = () => [...this.committed.transactions, ...working.transactions];
 
     const move = (command: ApplyMovementCommand, debit: boolean) => {
       const before = Wallet.rehydrate(findWallet(command.walletId)!);
@@ -122,13 +128,15 @@ export class InMemoryStore implements UnitOfWork {
             )?.transaction ?? null
           );
         },
-        hasActiveReversal: async (providerId, referenceExternalId) =>
-          allRows().some(
+        hasActiveReversal: async (providerId, referenceExternalId) => {
+          this.beforeHasActiveReversal?.(this);
+          return allRows().some(
             (r) =>
               isActiveReversal(r) &&
               r.transaction.providerId === providerId &&
               r.transaction.referenceExternalTransactionId === referenceExternalId,
-          ),
+          );
+        },
         insert: async (command) => {
           this.beforeInsert?.(this);
           const tx = command.transaction;
@@ -155,6 +163,20 @@ export class InMemoryStore implements UnitOfWork {
       outbox: {
         add: async (events) => {
           working.outbox.push(...events);
+        },
+      },
+      inbox: {
+        exists: async (consumer, messageId) => {
+          const key = inboxKey(consumer, messageId);
+          return this.committed.inbox.includes(key) || working.inbox.includes(key);
+        },
+        add: async (consumer, messageId) => {
+          this.beforeInboxAdd?.(this);
+          const key = inboxKey(consumer, messageId);
+          if (this.committed.inbox.includes(key) || working.inbox.includes(key)) {
+            throw new UniqueViolationError('inbox_messages_consumer_message_id_uq');
+          }
+          working.inbox.push(key);
         },
       },
     };

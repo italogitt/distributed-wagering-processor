@@ -15,5 +15,22 @@ services:
     volumes:
       - pgdata:/var/lib/postgresql/data
 
+  # 4.14.0: última versão que roda sem LOCALSTACK_AUTH_TOKEN (as 2026.x exigem licença).
+  localstack:
+    image: localstack/localstack:4.14.0
+    environment:
+      SERVICES: sqs
+    ports:
+      - "4566:4566"
+    volumes:
+      # Cria as filas quando o LocalStack fica pronto.
+      - ./localstack/init/ready.d:/etc/localstack/init/ready.d:ro
+    healthcheck:
+      # Saudável só depois que o init script terminou (filas criadas).
+      test: ["CMD-SHELL", "curl -fs localhost:4566/_localstack/init/ready | grep -q '\"completed\": true'"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
 volumes:
   pgdata:

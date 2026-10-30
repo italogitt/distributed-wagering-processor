@@ -5,6 +5,7 @@ import { WagerTransaction, WagerTransactionKind, WagerTransactionStatus } from '
 import type { Wallet } from '../../domain/wallet';
 import { LedgerDirection } from '../../domain/wallet-ledger-entry';
 import {
+  DuplicateMessageError,
   IdempotencyConflictError,
   InvalidInputError,
   UniqueViolationError,
@@ -40,6 +41,17 @@ export interface SubmitTransactionInput {
   referenceExternalTransactionId?: string;
 }
 
+/** Entrada pela fila: a mensagem entra na inbox na mesma transação SQL do efeito. */
+export interface InboxEntry {
+  consumer: string;
+  /** Id de negócio do corpo da mensagem (D16), não o MessageId do SQS. */
+  messageId: string;
+}
+
+export interface SubmitTransactionOptions {
+  inbox?: InboxEntry;
+}
+
 export interface SubmitTransactionOutput {
   transactionId: string;
   status: WagerTransactionStatus;
@@ -63,6 +75,7 @@ const FIRST_REFERENCE_RETRY_MS = 1_000;
 
 interface ParsedInput {
   input: SubmitTransactionInput;
+  inbox?: InboxEntry;
   kind: WagerTransactionKind;
   money: Money;
   payloadHash: string;
@@ -82,8 +95,8 @@ export class SubmitTransactionUseCase {
     private readonly ids: IdGenerator,
   ) {}
 
-  async execute(input: SubmitTransactionInput): Promise<SubmitTransactionOutput> {
-    const parsed = this.parse(input);
+  async execute(input: SubmitTransactionInput, options: SubmitTransactionOptions = {}): Promise<SubmitTransactionOutput> {
+    const parsed = { ...this.parse(input), inbox: options.inbox };
     try {
       return await this.uow.run((repos) => this.attempt(repos, parsed));
     } catch (error) {
@@ -95,7 +108,9 @@ export class SubmitTransactionUseCase {
       // entre a nossa leitura e o nosso INSERT. A transação SQL anterior já fez
       // rollback (inclusive do débito). Rodamos de novo UMA vez, numa transação
       // nova: agora o passo 3 (idempotência) ou o passo 6 (reversão ativa) acha
-      // a linha que venceu e devolve replay, 409 ou ALREADY_REVERSED.
+      // a linha que venceu e devolve replay, 409 ou ALREADY_REVERSED. Na entrada
+      // pela fila, a inbox é checada antes de tudo: se a violação foi da
+      // inbox (a mesma mensagem em outro consumer), sai DuplicateMessageError.
       // É isso que segura "50 envios iguais em paralelo" com um débito só.
       // Se violar de novo, o erro sobe (500): não fazemos loop.
       return this.uow.run((repos) => this.attempt(repos, parsed));
@@ -134,6 +149,17 @@ export class SubmitTransactionUseCase {
   private async attempt(repos: TransactionalRepositories, parsed: ParsedInput): Promise<SubmitTransactionOutput> {
     const { input } = parsed;
     const now = new Date();
+
+    // Inbox (só na entrada pela fila). Vem antes de tudo, inclusive na
+    // tentativa nova do passo 10. Se o caso de uso lançar depois daqui, o
+    // rollback desfaz a linha da inbox junto com o resto.
+    if (parsed.inbox) {
+      const { consumer, messageId } = parsed.inbox;
+      if (await repos.inbox.exists(consumer, messageId)) {
+        throw new DuplicateMessageError(messageId);
+      }
+      await repos.inbox.add(consumer, messageId, now);
+    }
 
     // 3. Idempotência.
     const existing = await repos.transactions.findByIdempotencyKey(input.providerId, input.idempotencyKey);
@@ -192,7 +218,6 @@ export class SubmitTransactionUseCase {
 
     // 7. Movimento de saldo.
     let movement: MovementApplied | undefined;
-    let balanceAfter = wallet.balance;
     if (tx.status === WagerTransactionStatus.Pending) {
       if (tx.affectsBalance()) {
         const command = {
@@ -206,8 +231,6 @@ export class SubmitTransactionUseCase {
           const result = await repos.wallets.applyDebit(command);
           if (result.status === 'INSUFFICIENT_BALANCE') {
             tx.reject(tx.insufficientFundsCode());
-            // Relê: o saldo pode ter mudado desde o passo 4 (foi o que nos deixou sem saldo).
-            balanceAfter = await this.currentBalance(repos, wallet);
           } else {
             movement = result;
           }
@@ -220,10 +243,12 @@ export class SubmitTransactionUseCase {
       }
     }
 
-    // 8. balance_after: depois do movimento; em REJECTED e LOSS, o saldo atual.
-    if (movement) {
-      balanceAfter = movement.wallet.balance;
-    }
+    // 8. balance_after: com movimento, o saldo que o UPDATE devolveu. Sem
+    // movimento (qualquer REJECTED e o LOSS), relê agora: o saldo do passo 4
+    // pode estar velho. Ex.: sem saldo porque outra BET debitou no meio, ou
+    // ALREADY_REVERSED porque a reversão vencedora (com o crédito dela)
+    // commitou entre os passos 4 e 6.
+    const balanceAfter = movement ? movement.wallet.balance : await this.currentBalance(repos, wallet);
 
     // 9. Estado final + eventos, na mesma transação SQL.
     await repos.transactions.insert({ transaction: tx, balanceAfter });

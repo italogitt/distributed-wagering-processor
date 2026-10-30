@@ -1,10 +1,12 @@
 import { UniqueConstraintViolationException } from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/postgresql';
-import { UniqueViolationError } from '../../application/errors';
+import { TransientInfrastructureError, UniqueViolationError } from '../../application/errors';
 import type { TransactionalRepositories, UnitOfWork } from '../../application/ports/unit-of-work';
+import { MikroOrmInboxRepository } from './repositories/mikro-orm-inbox.repository';
 import { MikroOrmOutboxRepository } from './repositories/mikro-orm-outbox.repository';
 import { MikroOrmTransactionRepository } from './repositories/mikro-orm-transaction.repository';
 import { MikroOrmWalletRepository } from './repositories/mikro-orm-wallet.repository';
+import { isTransientDatabaseError } from './transient-error';
 
 /**
  * Cada `run` abre uma transação SQL num EntityManager novo (`fork`), então
@@ -22,6 +24,7 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
           wallets: new MikroOrmWalletRepository(em),
           transactions: new MikroOrmTransactionRepository(em),
           outbox: new MikroOrmOutboxRepository(em),
+          inbox: new MikroOrmInboxRepository(em),
         }),
       );
     } catch (error) {
@@ -29,6 +32,9 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
         // O DriverException copia os campos do erro do `pg`, incluindo `constraint`.
         const { constraint } = error as UniqueConstraintViolationException & { constraint?: string };
         throw new UniqueViolationError(constraint ?? 'desconhecida');
+      }
+      if (isTransientDatabaseError(error)) {
+        throw new TransientInfrastructureError('Falha transitória no banco', { cause: error });
       }
       throw error;
     }
