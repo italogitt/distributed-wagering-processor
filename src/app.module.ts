@@ -6,8 +6,11 @@ import { APP_FILTER } from '@nestjs/core';
 import { PublishOutboxUseCase } from './application/use-cases/publish-outbox.use-case';
 import { ResolvePendingReferenceUseCase } from './application/use-cases/resolve-pending-reference.use-case';
 import { SubmitTransactionUseCase } from './application/use-cases/submit-transaction.use-case';
-import { JsonLogger } from './infrastructure/logging/logger';
+import { errorFields, JsonLogger } from './infrastructure/logging/logger';
+import { MeteredUnitOfWork } from './infrastructure/metrics/metered-unit-of-work';
+import { type Metrics, PrometheusMetrics } from './infrastructure/metrics/metrics';
 import mikroOrmConfig from './infrastructure/persistence/mikro-orm.config';
+import { readOutboxBacklog } from './infrastructure/persistence/outbox-backlog';
 import { MikroOrmUnitOfWork } from './infrastructure/persistence/mikro-orm-unit-of-work';
 import { SqsEventPublisher } from './infrastructure/sqs/sqs-event-publisher';
 import { createSqsClient, loadSqsConfig, type SqsConfig } from './infrastructure/sqs/sqs.config';
@@ -20,7 +23,8 @@ import {
   type HealthDependencies,
   SQS_CLIENT,
 } from './interfaces/http/health.controller';
-import { WageringController } from './interfaces/http/wagering.controller';
+import { METRICS, METRICS_REGISTRY, MetricsController } from './interfaces/http/metrics.controller';
+import { WAGERING_LOGGER, WageringController } from './interfaces/http/wagering.controller';
 import { SqsWagerConsumer } from './interfaces/sqs/sqs-wager-consumer';
 import { OutboxPublisherWorker } from './interfaces/workers/outbox-publisher.worker';
 import { PendingReferenceWorker } from './interfaces/workers/pending-reference.worker';
@@ -32,14 +36,30 @@ const SQS_CONFIG = Symbol('SQS_CONFIG');
     // Sem request context: o UnitOfWork faz `fork()` a cada transação.
     MikroOrmModule.forRoot({ ...mikroOrmConfig, registerRequestContext: false }),
   ],
-  controllers: [WageringController, HealthController],
+  controllers: [WageringController, HealthController, MetricsController],
   providers: [
     { provide: APP_FILTER, useClass: ApplicationErrorFilter },
     {
+      // Um Registry por app (não o global do prom-client): métricas da instância.
+      provide: PrometheusMetrics,
+      inject: [EntityManager],
+      useFactory: (em: EntityManager) => {
+        const logger = new JsonLogger('Metrics');
+        return new PrometheusMetrics(
+          () => readOutboxBacklog(em),
+          (error) => logger.warn('outbox backlog read failed', errorFields(error)),
+        );
+      },
+    },
+    { provide: METRICS, useExisting: PrometheusMetrics },
+    { provide: METRICS_REGISTRY, inject: [PrometheusMetrics], useFactory: (m: PrometheusMetrics) => m.registry },
+    { provide: WAGERING_LOGGER, useFactory: () => new JsonLogger('WageringController') },
+    {
       // O caso de uso não conhece o Nest: a montagem fica aqui.
       provide: SubmitTransactionUseCase,
-      inject: [EntityManager],
-      useFactory: (em: EntityManager) => new SubmitTransactionUseCase(new MikroOrmUnitOfWork(em), new UuidV7IdGenerator()),
+      inject: [EntityManager, METRICS],
+      useFactory: (em: EntityManager, metrics: Metrics) =>
+        new SubmitTransactionUseCase(new MeteredUnitOfWork(new MikroOrmUnitOfWork(em), metrics), new UuidV7IdGenerator()),
     },
     { provide: SQS_CONFIG, useFactory: () => loadSqsConfig() },
     { provide: SQS_CLIENT, inject: [SQS_CONFIG], useFactory: (config: SqsConfig) => createSqsClient(config) },
@@ -55,35 +75,35 @@ const SQS_CONFIG = Symbol('SQS_CONFIG');
     {
       // Liga sozinho no bootstrap se SQS_CONSUMER_ENABLED=true; para no shutdown.
       provide: SqsWagerConsumer,
-      inject: [SQS_CLIENT, SubmitTransactionUseCase, SQS_CONFIG],
-      useFactory: (sqs: SQSClient, useCase: SubmitTransactionUseCase, config: SqsConfig) =>
-        new SqsWagerConsumer(sqs, useCase, config.consumer, new JsonLogger('SqsWagerConsumer')),
+      inject: [SQS_CLIENT, SubmitTransactionUseCase, SQS_CONFIG, METRICS],
+      useFactory: (sqs: SQSClient, useCase: SubmitTransactionUseCase, config: SqsConfig, metrics: Metrics) =>
+        new SqsWagerConsumer(sqs, useCase, config.consumer, new JsonLogger('SqsWagerConsumer'), metrics),
     },
     {
       // Liga sozinho se OUTBOX_PUBLISHER_ENABLED=true; no SIGTERM termina o lote atual.
       provide: OutboxPublisherWorker,
-      inject: [EntityManager, SQS_CLIENT],
-      useFactory: (em: EntityManager, sqs: SQSClient) => {
+      inject: [EntityManager, SQS_CLIENT, METRICS],
+      useFactory: (em: EntityManager, sqs: SQSClient, metrics: Metrics) => {
         const options = loadOutboxPublisherConfig();
         const useCase = new PublishOutboxUseCase(
           new MikroOrmUnitOfWork(em),
           new SqsEventPublisher(sqs, options.queueUrl),
           options,
         );
-        return new OutboxPublisherWorker(useCase, options, new JsonLogger('OutboxPublisher'));
+        return new OutboxPublisherWorker(useCase, options, new JsonLogger('OutboxPublisher'), metrics);
       },
     },
     {
       // Liga sozinho se PENDING_REFERENCE_WORKER_ENABLED=true; no SIGTERM termina a transação atual.
       provide: PendingReferenceWorker,
-      inject: [EntityManager],
-      useFactory: (em: EntityManager) => {
+      inject: [EntityManager, METRICS],
+      useFactory: (em: EntityManager, metrics: Metrics) => {
         const options = loadPendingReferenceConfig();
         const useCase = new ResolvePendingReferenceUseCase(new MikroOrmUnitOfWork(em), new UuidV7IdGenerator(), {
           ttlMs: options.ttlSeconds * 1_000,
           backoffMaxSeconds: options.backoffMaxSeconds,
         });
-        return new PendingReferenceWorker(useCase, options, new JsonLogger('PendingReferenceWorker'));
+        return new PendingReferenceWorker(useCase, options, new JsonLogger('PendingReferenceWorker'), metrics);
       },
     },
   ],

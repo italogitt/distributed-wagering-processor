@@ -11,6 +11,7 @@ import { backoffSeconds } from '../../application/backoff';
 import { ApplicationError, DuplicateMessageError, InvalidInputError } from '../../application/errors';
 import type { SubmitTransactionUseCase } from '../../application/use-cases/submit-transaction.use-case';
 import { errorFields, type LogFields, type Logger } from '../../infrastructure/logging/logger';
+import { type DlqReason, type Metrics, NOOP_METRICS } from '../../infrastructure/metrics/metrics';
 import { settlesWithin, sleep } from '../workers/timing';
 import { parseWagerMessage, type WagerMessage } from './wager-message';
 
@@ -68,6 +69,7 @@ export class SqsWagerConsumer implements OnApplicationBootstrap, BeforeApplicati
     private readonly submitTransaction: SubmitTransactionUseCase,
     private readonly options: SqsConsumerOptions,
     private readonly logger: Logger,
+    private readonly metrics: Metrics = NOOP_METRICS,
   ) {}
 
   onApplicationBootstrap(): void {
@@ -180,7 +182,7 @@ export class SqsWagerConsumer implements OnApplicationBootstrap, BeforeApplicati
     try {
       wager = parseWagerMessage(message.Body);
     } catch (error) {
-      return this.sendToDlq(message, error, base, startedAt);
+      return this.sendToDlq(message, 'malformed_message', error, base, startedAt);
     }
 
     const fields: LogFields = {
@@ -194,14 +196,22 @@ export class SqsWagerConsumer implements OnApplicationBootstrap, BeforeApplicati
       const output = await this.submitTransaction.execute(wager.input, {
         inbox: { consumer: this.options.consumerName, messageId: wager.messageId },
       });
-      const result = { ...fields, transactionId: output.transactionId, idempotentReplay: output.idempotentReplay };
+      this.metrics.transactionDecided({ source: 'sqs', kind: wager.input.kind, ...output });
+      this.metrics.observeProcessing('sqs', (performance.now() - startedAt) / 1_000);
+      const result = {
+        ...fields,
+        transactionId: output.transactionId,
+        failureCode: output.failureCode,
+        idempotentReplay: output.idempotentReplay,
+      };
       return this.ack(message, 'processed', output.status, result, startedAt);
     } catch (error) {
       if (error instanceof DuplicateMessageError) {
+        this.metrics.inboxDuplicate();
         return this.ack(message, 'duplicate', 'ALREADY_IN_INBOX', fields, startedAt);
       }
       if (error instanceof InvalidInputError) {
-        return this.sendToDlq(message, error, fields, startedAt);
+        return this.sendToDlq(message, 'invalid_input', error, fields, startedAt);
       }
       if (error instanceof ApplicationError) {
         // 404, 409, 422: decisão de negócio, reenviar não muda nada.
@@ -251,12 +261,21 @@ export class SqsWagerConsumer implements OnApplicationBootstrap, BeforeApplicati
       }
     }
     const detail = error instanceof Error ? error.name : 'UnknownError';
+    this.metrics.retry('sqs_consumer');
     this.log('warn', 'retry', detail, { ...fields, ...errorFields(error), backoffSeconds: delaySeconds }, startedAt);
     return this.result(message, 'retry', detail, fields);
   }
 
-  private async sendToDlq(message: Message, error: unknown, fields: LogFields, startedAt: number): Promise<MessageResult> {
-    const reason = error instanceof Error ? error.message : String(error);
+  private async sendToDlq(
+    message: Message,
+    reason: DlqReason,
+    error: unknown,
+    fields: LogFields,
+    startedAt: number,
+  ): Promise<MessageResult> {
+    // A mensagem do erro pode citar o valor ("LOSS exige valor 0, recebeu 10.00"):
+    // vai só no atributo da cópia na DLQ, nunca no log.
+    const failureReason = error instanceof Error ? error.message : String(error);
     if (this.inFlight.has(message.ReceiptHandle!)) {
       try {
         await this.sqs.send(
@@ -266,15 +285,17 @@ export class SqsWagerConsumer implements OnApplicationBootstrap, BeforeApplicati
             MessageGroupId: message.Attributes?.MessageGroupId ?? 'invalid',
             // O MessageId do SQS é único por envio: um reenvio para a DLQ (após falha no ack) é deduplicado.
             MessageDeduplicationId: message.MessageId,
-            MessageAttributes: { failureReason: { DataType: 'String', StringValue: reason.slice(0, 256) } },
+            MessageAttributes: { failureReason: { DataType: 'String', StringValue: failureReason.slice(0, 256) } },
           }),
         );
       } catch (sendError) {
         // Sem a cópia na DLQ, não dá ack: trata como transitório.
         return this.retry(message, sendError, fields, startedAt);
       }
+      this.metrics.dlq(reason);
     }
-    return this.ack(message, 'dlq', reason, fields, startedAt);
+    const errorName = error instanceof Error ? error.name : 'UnknownError';
+    return this.ack(message, 'dlq', reason, { ...fields, errorName }, startedAt);
   }
 
   private async release(message: Message, reason: string): Promise<MessageResult> {

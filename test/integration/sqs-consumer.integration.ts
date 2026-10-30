@@ -215,17 +215,22 @@ describe('4. erro transitório', () => {
 
 describe('5. mensagem permanente → DLQ, nada gravado', () => {
   test.each([
-    ['JSON inválido', () => '{"messageId": "msg-x", '],
-    ['type desconhecido', (body: ReturnType<typeof wagerMessage>) => JSON.stringify({ ...body, type: 'Outro' })],
+    ['JSON inválido', 'malformed_message', () => '{"messageId": "msg-x", '],
+    [
+      'type desconhecido',
+      'malformed_message',
+      (body: ReturnType<typeof wagerMessage>) => JSON.stringify({ ...body, type: 'Outro' }),
+    ],
     [
       'valor inválido (InvalidInputError do caso de uso)',
+      'invalid_input',
       (body: ReturnType<typeof wagerMessage>) =>
         JSON.stringify({ ...body, data: { ...body.data, money: { amount: '25', currency: 'BRL' } } }),
     ],
-  ])(
+  ] as const)(
     '%s',
-    async (_case, makeBody) => {
-      const { consumer: c } = await consumer();
+    async (_case, reason, makeBody) => {
+      const { consumer: c, logger } = await consumer();
       const wallet = await seedWallet('100.00');
       const body = wagerMessage(wallet);
       await send(queues.queueUrl, makeBody(body));
@@ -236,7 +241,11 @@ describe('5. mensagem permanente → DLQ, nada gravado', () => {
       await queueIsEmpty();
       const dlq = await peekDlq(queues.dlqUrl);
       expect(dlq).toHaveLength(1);
-      expect(dlq[0]!.MessageAttributes?.failureReason?.StringValue).toBe(result!.detail);
+      expect(result!.detail).toBe(reason);
+      // O motivo completo (pode citar o valor) fica só na cópia da DLQ, não no log.
+      const failureReason = dlq[0]!.MessageAttributes?.failureReason?.StringValue;
+      expect(failureReason).toBeTruthy();
+      expect(JSON.stringify(logger.lines)).not.toContain(JSON.stringify(failureReason).slice(1, -1));
       expect(await countWalletTransactions(wallet.id)).toBe(0);
       expect(await countInboxMessages(body.messageId)).toBe(0);
       expect(await countOutboxEvents(wallet.id)).toBe(0);

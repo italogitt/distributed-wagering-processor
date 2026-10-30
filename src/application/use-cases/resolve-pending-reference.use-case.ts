@@ -15,6 +15,8 @@ export interface ResolvePendingReferenceOptions {
 interface ResolutionBase {
   transactionId: string;
   kind: WagerTransactionKind;
+  walletId: string;
+  providerId?: string;
   correlationId: string;
   /** Tentativas do worker, contando esta. */
   attempts: number;
@@ -66,7 +68,14 @@ export class ResolvePendingReferenceUseCase {
       // Sem o evento original (não deveria acontecer), o id da transação ainda liga os eventos.
       const correlationId = (await repos.outbox.correlationIdOf(tx.id)) ?? tx.id;
       const ctx = { now, correlationId };
-      const base = { transactionId: tx.id, kind: tx.kind, correlationId, attempts };
+      const base = {
+        transactionId: tx.id,
+        kind: tx.kind,
+        walletId: tx.walletId,
+        providerId: tx.providerId,
+        correlationId,
+        attempts,
+      };
 
       let settlement = await this.settlement.settle(repos, tx, ctx);
       if (settlement.status === 'WAITING_REFERENCE') {
